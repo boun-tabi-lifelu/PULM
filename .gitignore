@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+.env
+
+# Data (unzip training data.zip locally)
+training data/
+
+# Large run artifacts (CSVs in outputs/ are tracked)
+outputs/embeddings/
+outputs/*/finetuned_weights.pth
+outputs/*/hf_cache/
+
+# Caches
+.cache/
+
+# Backups
+*.bak
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
