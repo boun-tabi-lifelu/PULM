@@ -33,4 +33,4 @@ Scores: `outputs/experiments.csv`. Comparison table: `outputs/comparison.csv`. F
 | `training data.zip` | Task splits (unzip → `training data/`) |
 | `outputs/` | Run logs (CSVs committed; weights/embeddings local) |
 
-Per-residue tasks (SecStr, Disorder) are only in `notebooks/` and `training data/SecStr/`, not in `run.py` yet.
+Per-residue tasks (SecStr, Disorder) are in `notebooks/` and `training data/SecStr/`, not in `run.py` yet. (Will be included soon!)
