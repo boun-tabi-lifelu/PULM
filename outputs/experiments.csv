@@ -1,0 +1,13 @@
+timestamp,task,model,checkpoint,method,metric,test_score,val_score,epochs,lr,batch,seed,run_dir
+2026-05-21T22:16:24.384562+00:00,GB1,esm2_8m,facebook/esm2_t6_8M_UR50D,full_ft,spearmanr,0.883651,0.918695,20.0,2e-05,8,42,/cta/users/amirreza/Finetuning_Downstream_Tasks/PULM/outputs/gb1
+2026-05-21T23:20:02.231665+00:00,AAV,esm2_8m,facebook/esm2_t6_8M_UR50D,full_ft,spearmanr,0.851149,0.893157,10.0,2e-05,8,42,/cta/users/amirreza/Finetuning_Downstream_Tasks/PULM/outputs/aav
+2026-05-21T23:51:19.020318+00:00,GFP,esm2_8m,facebook/esm2_t6_8M_UR50D,full_ft,spearmanr,0.694336,0.833404,20.0,2e-05,8,42,/cta/users/amirreza/Finetuning_Downstream_Tasks/PULM/outputs/gfp
+2026-05-22T01:05:29.846489+00:00,Meltome,esm2_8m,facebook/esm2_t6_8M_UR50D,full_ft,spearmanr,0.524636,0.559373,10.0,2e-05,8,42,/cta/users/amirreza/Finetuning_Downstream_Tasks/PULM/outputs/meltome
+2026-05-22T01:31:14.151426+00:00,Stab,esm2_8m,facebook/esm2_t6_8M_UR50D,full_ft,spearmanr,0.732701,0.80649,10.0,2e-05,8,42,/cta/users/amirreza/Finetuning_Downstream_Tasks/PULM/outputs/stab
+2026-05-22T02:03:12.193227+00:00,SubLoc,esm2_8m,facebook/esm2_t6_8M_UR50D,full_ft,accuracy,0.55102,0.787843,10.0,2e-05,8,42,/cta/users/amirreza/Finetuning_Downstream_Tasks/PULM/outputs/subloc
+2026-05-22T08:33:42.482089+00:00,Meltome,esm2_8m,facebook/esm2_t6_8M_UR50D,embed_head,spearmanr,0.572167,0.54581,120.0,0.0001,8,42,/cta/users/amirreza/Finetuning_Downstream_Tasks/PULM/outputs/embeddings/meltome
+2026-05-22T08:58:09.364670+00:00,Stab,esm2_8m,facebook/esm2_t6_8M_UR50D,embed_head,spearmanr,0.707154,0.653947,120.0,0.0001,8,42,/cta/users/amirreza/Finetuning_Downstream_Tasks/PULM/outputs/embeddings/stab
+2026-05-22T12:02:02.512286+00:00,SubLoc,esm2_8m,facebook/esm2_t6_8M_UR50D,embed_head,accuracy,0.502041,0.750298,120.0,0.0001,8,42,/cta/users/amirreza/Finetuning_Downstream_Tasks/PULM/outputs/embeddings/subloc
+2026-05-22T12:11:16.933091+00:00,GB1,esm2_8m,facebook/esm2_t6_8M_UR50D,embed_head,spearmanr,0.824917,0.858371,240.0,0.0001,8,42,/cta/users/amirreza/Finetuning_Downstream_Tasks/PULM/outputs/embeddings/gb1
+2026-05-22T12:30:55.418085+00:00,AAV,esm2_8m,facebook/esm2_t6_8M_UR50D,embed_head,spearmanr,0.637349,0.848843,120.0,0.0001,8,42,/cta/users/amirreza/Finetuning_Downstream_Tasks/PULM/outputs/embeddings/aav
+2026-05-22T12:50:57.468817+00:00,GFP,esm2_8m,facebook/esm2_t6_8M_UR50D,embed_head,spearmanr,0.637523,0.719359,240.0,0.0001,8,42,/cta/users/amirreza/Finetuning_Downstream_Tasks/PULM/outputs/embeddings/gfp
