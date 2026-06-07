@@ -35,6 +35,21 @@ Tokenizers (`--tokenizer_type`)
   --tokenizer_file). Special-token *strings* are read from the ESM2 tokenizer so
   they never drift from the original.
 
+Training a new tokenizer onto a pretrained backbone is unstable if you update
+the random new embeddings and the highly-tuned backbone together at a high LR
+(catastrophic forgetting + garbage gradients from the new tokens). Two knobs
+address this:
+  * Low LR : single-stage continual training defaults to 2e-5 (NOT 1e-4, which
+             is a from-scratch LR and wrecks the pretrained weights).
+  * --two_stage : the recommended freeze-and-train strategy for bpe/puma:
+        Stage 1 - freeze the ESM2 backbone, train ONLY the new vocab layers
+                  (input embeddings + lm_head) so the new tokens align to the
+                  frozen backbone (default: half the epochs, lr 1e-4).
+                  This protects the pretrained attention maps.
+        Stage 2 - unfreeze everything and fine-tune end-to-end at a much lower
+                  LR (default 1e-5) for the remaining epochs.
+        Two-stage runs append '_TS' to the auto run name.
+
 Data        : FASTA file, or the SQLite protein DB (--data_source db).
 Hardware    : single- or multi-GPU (launch with `torchrun` for DDP).
 Tracking    : Weights & Biases.
@@ -59,6 +74,12 @@ Examples
     # BPE tokenizer, learn the whole vocab layer from scratch:
     python train.py --fasta data/human.fasta --model_size 150M \
         --tokenizer_type bpe --vocab_size 6400 --embedding_init scratch
+
+    # RECOMMENDED for a new tokenizer: two-stage freeze-and-train
+    # (stage1 = frozen backbone @1e-4, stage2 = full model @1e-5):
+    python train.py --data_source db --model_size 35M --tokenizer_type puma \
+        --vocab_size 51200 --two_stage --num_train_epochs 6 \
+        --stage1_ratio 0.5 --wandb_project protein-clm
 """
 
 import argparse
@@ -172,7 +193,8 @@ def resolve_tokenizer_path(args) -> str:
 
 def build_run_slug(args) -> str:
     """Auto name for output_dir / wandb run, e.g.
-       ESM2_8M_PUMA_blosum62_07_005_51200 / ESM2_35M_BPE_51200 / ESM2_35M_AA."""
+       ESM2_8M_PUMA_blosum62_07_005_51200 / ESM2_35M_BPE_51200 / ESM2_35M_AA.
+       The two-stage freeze-and-train strategy appends '_TS'."""
     size = args.model_size or "custom"
     ttype = args.tokenizer_type.lower()
     nodot = lambda v: str(v).replace(".", "")   # 0.7 -> 07, 0.05 -> 005
@@ -183,7 +205,10 @@ def build_run_slug(args) -> str:
         tok = f"BPE_{args.vocab_size}"
     else:  # aa
         tok = "AA"
-    return f"ESM2_{size}_{tok}"
+    slug = f"ESM2_{size}_{tok}"
+    if getattr(args, "two_stage", False):
+        slug += "_TS"   # Two-Stage freeze-and-train
+    return slug
 
 
 # ============================================================================= #
@@ -573,11 +598,12 @@ def resolve_precision(choice: str):
     return torch.cuda.is_available(), False
 
 
-def compute_warmup_steps(args, n_train: int) -> int:
+def compute_warmup_steps(args, n_train: int, num_epochs: Optional[float] = None) -> int:
     if args.warmup_steps and args.warmup_steps > 0:
         return args.warmup_steps
     if not args.warmup_ratio or args.warmup_ratio <= 0:
         return 0
+    num_epochs = args.num_train_epochs if num_epochs is None else num_epochs
     world = int(os.environ.get("WORLD_SIZE", "1") or "1")
     eff_batch = max(1, args.per_device_train_batch_size *
                     args.gradient_accumulation_steps * world)
@@ -585,11 +611,37 @@ def compute_warmup_steps(args, n_train: int) -> int:
         total = args.max_steps
     else:
         steps_per_epoch = math.ceil(n_train / eff_batch)
-        total = int(steps_per_epoch * args.num_train_epochs)
+        total = int(steps_per_epoch * num_epochs)
     steps = max(1, int(args.warmup_ratio * total))
     logger.info("warmup: ratio %.3f x ~%d total steps -> %d warmup steps "
                 "(world_size=%d)", args.warmup_ratio, total, steps, world)
     return steps
+
+
+# ============================================================================= #
+#  TWO-STAGE FREEZE-AND-TRAIN
+#  Stage 1: freeze the pretrained transformer backbone and train ONLY the new
+#           vocabulary layers (input embeddings + lm_head). This lets the freshly
+#           seeded token embeddings align to the frozen backbone's expectations
+#           without corrupting the pretrained attention maps.
+#  Stage 2: unfreeze everything and fine-tune end-to-end at a much lower LR.
+# ============================================================================= #
+def set_backbone_trainable(model, trainable: bool):
+    """Freeze/unfreeze the transformer backbone, always keeping the
+    vocabulary-dependent layers (input embeddings + lm_head) trainable."""
+    for p in model.parameters():
+        p.requires_grad = trainable
+    if not trainable:
+        for p in model.get_input_embeddings().parameters():
+            p.requires_grad = True
+        if getattr(model, "lm_head", None) is not None:
+            for p in model.lm_head.parameters():
+                p.requires_grad = True
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_all = sum(p.numel() for p in model.parameters())
+    logger.info("Backbone %s | trainable params: %.1fM / %.1fM (%.1f%%)",
+                "UNFROZEN" if trainable else "FROZEN (vocab layers only)",
+                n_train / 1e6, n_all / 1e6, 100.0 * n_train / max(1, n_all))
 
 
 # ============================================================================= #
@@ -663,11 +715,13 @@ def parse_args():
     # MLM
     p.add_argument("--mlm_probability", type=float, default=0.15)
 
-    # optimisation (continual-training-flavoured defaults: lower LR than scratch)
+    # optimisation (continual-training-flavoured defaults: MUCH lower LR than
+    # scratch -- a high LR on the pretrained backbone causes catastrophic
+    # forgetting, so single-stage continual training defaults to 2e-5).
     p.add_argument("--per_device_train_batch_size", type=int, default=32)
     p.add_argument("--per_device_eval_batch_size", type=int, default=32)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    p.add_argument("--learning_rate", type=float, default=1e-4)
+    p.add_argument("--learning_rate", type=float, default=2e-5)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--adam_beta1", type=float, default=0.9)
     p.add_argument("--adam_beta2", type=float, default=0.98)
@@ -678,6 +732,23 @@ def parse_args():
     p.add_argument("--warmup_ratio", type=float, default=0.05)
     p.add_argument("--warmup_steps", type=int, default=0)
     p.add_argument("--lr_scheduler_type", default="cosine")
+
+    # two-stage freeze-and-train (recommended for new bpe/puma tokenizers)
+    p.add_argument("--two_stage", action="store_true",
+                   help="Stage 1: freeze backbone, train ONLY the new vocab layers; "
+                        "Stage 2: unfreeze and fine-tune end-to-end at a lower LR. "
+                        "Appends '_TS' to the auto run name.")
+    p.add_argument("--stage1_ratio", type=float, default=0.5,
+                   help="Fraction of --num_train_epochs spent in the frozen stage 1 "
+                        "(ignored if --stage1_epochs is set).")
+    p.add_argument("--stage1_epochs", type=float, default=None,
+                   help="Explicit epoch count for stage 1 (overrides --stage1_ratio).")
+    p.add_argument("--stage1_learning_rate", type=float, default=1e-4,
+                   help="LR for stage 1 (only the new vocab layers train, so this "
+                        "can be high -- they start random).")
+    p.add_argument("--stage2_learning_rate", type=float, default=1e-5,
+                   help="LR for stage 2 end-to-end fine-tuning (keep it low to avoid "
+                        "catastrophic forgetting of the pretrained backbone).")
 
     # hardware / efficiency
     p.add_argument("--precision", default="auto", choices=["auto", "bf16", "fp16", "no"])
@@ -816,6 +887,76 @@ def sanity_check(orig_name, trained_dir, sequences, topk, max_length, offline):
 
 
 # ============================================================================= #
+#  TRAINER FACTORY  (shared by single-stage and the two-stage strategy)
+# ============================================================================= #
+def build_trainer(args, model, tokenizer, train_ds, eval_ds, collator, *,
+                  learning_rate, num_train_epochs, output_dir, run_name,
+                  report_to, load_best):
+    from transformers import Trainer, TrainingArguments
+
+    fp16, bf16 = resolve_precision(args.precision)
+    do_eval = eval_ds is not None
+    warmup_steps = compute_warmup_steps(args, len(train_ds), num_train_epochs)
+
+    ta_kwargs = dict(
+        output_dir=output_dir, seed=args.seed,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        num_train_epochs=num_train_epochs, max_steps=args.max_steps,
+        learning_rate=learning_rate, weight_decay=args.weight_decay,
+        adam_beta1=args.adam_beta1, adam_beta2=args.adam_beta2,
+        adam_epsilon=args.adam_epsilon, max_grad_norm=args.max_grad_norm,
+        warmup_steps=warmup_steps, lr_scheduler_type=args.lr_scheduler_type,
+        fp16=fp16, bf16=bf16, gradient_checkpointing=args.gradient_checkpointing,
+        group_by_length=args.group_by_length, length_column_name="length",
+        dataloader_num_workers=args.dataloader_num_workers,
+        torch_compile=args.torch_compile,
+        do_eval=do_eval, eval_strategy="steps" if do_eval else "no",
+        eval_steps=args.eval_steps, logging_steps=args.logging_steps,
+        save_strategy="steps", save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
+        load_best_model_at_end=load_best,
+        metric_for_best_model="eval_loss" if load_best else None,
+        greater_is_better=False, report_to=report_to, run_name=run_name,
+        ddp_find_unused_parameters=False,
+    )
+    training_args = make_training_args(TrainingArguments, ta_kwargs)
+
+    # Trainer renamed `tokenizer` -> `processing_class` in transformers 4.46+.
+    trainer_kwargs = dict(model=model, args=training_args, train_dataset=train_ds,
+                          eval_dataset=eval_ds, data_collator=collator)
+    if "processing_class" in inspect.signature(Trainer.__init__).parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        trainer_kwargs["tokenizer"] = tokenizer
+    return Trainer(**trainer_kwargs)
+
+
+def log_adapt_stats(args, trainer, adapt_stats):
+    """Record the embedding-adaptation breakdown to the active wandb run."""
+    if not (args.wandb_project and trainer.is_world_process_zero()):
+        return
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.config.update({f"adapt/{k}": v for k, v in adapt_stats.items()},
+                                allow_val_change=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def finish_wandb():
+    """Close the current wandb run so the next stage starts a fresh one."""
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.finish()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ============================================================================= #
 #  MAIN
 # ============================================================================= #
 def main():
@@ -824,8 +965,7 @@ def main():
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-    from transformers import (DataCollatorForLanguageModeling, Trainer,
-                              TrainingArguments, set_seed)
+    from transformers import DataCollatorForLanguageModeling, set_seed
     set_seed(args.seed)
 
     if args.data_source == "fasta" and not args.fasta:
@@ -861,56 +1001,70 @@ def main():
         tokenizer=tokenizer, mlm=True, mlm_probability=args.mlm_probability,
         pad_to_multiple_of=8)
 
-    fp16, bf16 = resolve_precision(args.precision)
     do_eval = eval_ds is not None
-    warmup_steps = compute_warmup_steps(args, len(train_ds))
+    common = dict(args=args, model=model, tokenizer=tokenizer, train_ds=train_ds,
+                  eval_ds=eval_ds, collator=collator, report_to=report_to)
 
-    ta_kwargs = dict(
-        output_dir=args.output_dir, seed=args.seed,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        num_train_epochs=args.num_train_epochs, max_steps=args.max_steps,
-        learning_rate=args.learning_rate, weight_decay=args.weight_decay,
-        adam_beta1=args.adam_beta1, adam_beta2=args.adam_beta2,
-        adam_epsilon=args.adam_epsilon, max_grad_norm=args.max_grad_norm,
-        warmup_steps=warmup_steps, lr_scheduler_type=args.lr_scheduler_type,
-        fp16=fp16, bf16=bf16, gradient_checkpointing=args.gradient_checkpointing,
-        group_by_length=args.group_by_length, length_column_name="length",
-        dataloader_num_workers=args.dataloader_num_workers,
-        torch_compile=args.torch_compile,
-        do_eval=do_eval, eval_strategy="steps" if do_eval else "no",
-        eval_steps=args.eval_steps, logging_steps=args.logging_steps,
-        save_strategy="steps", save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,
-        load_best_model_at_end=do_eval,
-        metric_for_best_model="eval_loss" if do_eval else None,
-        greater_is_better=False, report_to=report_to, run_name=run_name,
-        ddp_find_unused_parameters=False,
-    )
-    training_args = make_training_args(TrainingArguments, ta_kwargs)
+    # ------------------------------------------------------------------ #
+    #  TWO-STAGE freeze-and-train  (stage 1: vocab layers only, frozen
+    #  backbone; stage 2: unfreeze, fine-tune end-to-end at a lower LR)
+    # ------------------------------------------------------------------ #
+    if args.two_stage:
+        if args.resume_from_checkpoint:
+            logger.warning("--resume_from_checkpoint is ignored in --two_stage mode.")
+        total = args.num_train_epochs
+        s1 = args.stage1_epochs if args.stage1_epochs is not None else args.stage1_ratio * total
+        s1 = max(0.0, min(round(s1, 6), total))
+        s2 = max(0.0, round(total - s1, 6))
+        if args.wandb_project and not os.environ.get("WANDB_RUN_GROUP"):
+            os.environ["WANDB_RUN_GROUP"] = slug    # group both stages together
 
-    # Trainer renamed `tokenizer` -> `processing_class` in transformers 4.46+.
-    trainer_kwargs = dict(model=model, args=training_args, train_dataset=train_ds,
-                          eval_dataset=eval_ds, data_collator=collator)
-    if "processing_class" in inspect.signature(Trainer.__init__).parameters:
-        trainer_kwargs["processing_class"] = tokenizer
+        trainer = None
+        # ---- Stage 1: frozen backbone, vocab layers only ---- #
+        if s1 > 0:
+            set_backbone_trainable(model, False)
+            logger.info("=== STAGE 1/2: frozen backbone, vocab layers only "
+                        "(%.3g epochs @ lr=%g) ===", s1, args.stage1_learning_rate)
+            trainer = build_trainer(
+                **common, learning_rate=args.stage1_learning_rate,
+                num_train_epochs=s1,
+                output_dir=os.path.join(args.output_dir, "stage1"),
+                run_name=(run_name + "_s1") if run_name else None,
+                load_best=False)
+            log_adapt_stats(args, trainer, adapt_stats)
+            trainer.train()
+            finish_wandb()          # so stage 2 logs to its own run
+
+        # ---- Stage 2: unfreeze, fine-tune end-to-end ---- #
+        if s2 > 0:
+            set_backbone_trainable(model, True)
+            logger.info("=== STAGE 2/2: full model end-to-end "
+                        "(%.3g epochs @ lr=%g) ===", s2, args.stage2_learning_rate)
+            trainer = build_trainer(
+                **common, learning_rate=args.stage2_learning_rate,
+                num_train_epochs=s2,
+                output_dir=os.path.join(args.output_dir, "stage2"),
+                run_name=(run_name + "_s2") if run_name else None,
+                load_best=do_eval)
+            if s1 <= 0:
+                log_adapt_stats(args, trainer, adapt_stats)
+            trainer.train()
+
+        if trainer is None:
+            raise ValueError("Two-stage training ran zero epochs; check "
+                             "--num_train_epochs / --stage1_ratio.")
+    # ------------------------------------------------------------------ #
+    #  SINGLE-STAGE continual training (whole model, low LR)
+    # ------------------------------------------------------------------ #
     else:
-        trainer_kwargs["tokenizer"] = tokenizer
-    trainer = Trainer(**trainer_kwargs)
-
-    # log the embedding-adaptation breakdown to wandb too
-    if args.wandb_project and trainer.is_world_process_zero():
-        try:
-            import wandb
-            if wandb.run is not None:
-                wandb.config.update({f"adapt/{k}": v for k, v in adapt_stats.items()},
-                                    allow_val_change=True)
-        except Exception:  # noqa: BLE001
-            pass
-
-    logger.info("Starting continual training ...")
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+        trainer = build_trainer(
+            **common, learning_rate=args.learning_rate,
+            num_train_epochs=args.num_train_epochs,
+            output_dir=args.output_dir, run_name=run_name, load_best=do_eval)
+        log_adapt_stats(args, trainer, adapt_stats)
+        logger.info("Starting single-stage continual training (lr=%g) ...",
+                    args.learning_rate)
+        trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
     final_dir = os.path.join(args.output_dir, "final")
     trainer.save_model(final_dir)
