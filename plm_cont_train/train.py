@@ -50,7 +50,12 @@ address this:
                   LR (default 1e-5) for the remaining epochs.
         Two-stage runs append '_TS' to the auto run name.
 
-Data        : FASTA file, or the SQLite protein DB (--data_source db).
+Data        : --training_data selects the corpus -- 'human' (67k human set),
+              'all' (full UniRef50 plm_train/plm_validation split tables built by
+              scripts/prepare_uniref50_splits.py), or 'fasta'. All paths use
+              on-the-fly random cropping to --max_length CORE tokens with
+              ESM-2-style BOS/EOS boundary signalling (specials added only when
+              the crop captures the protein's true start/end).
 Hardware    : single- or multi-GPU (launch with `torchrun` for DDP).
 Tracking    : Weights & Biases.
 Sanity check: after training we reload BOTH the original pretrained ESM2 and the
@@ -88,8 +93,12 @@ import inspect
 import math
 import os
 import logging
+import random
+import sqlite3
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional
+
+import numpy as np
 
 # Server defaults: don't clobber values the user/torchrun already exported.
 os.environ.setdefault("HF_HOME", "/cta/share/users/esm")
@@ -362,14 +371,12 @@ def iter_fasta(path: str, min_length: int, max_samples: Optional[int]) -> Iterat
             yield rec
 
 
-def load_db_sequences(args):
-    """Pull protein sequences from the SQLite DB into a HuggingFace Dataset."""
-    import sqlite3
+def load_human_sequences(args) -> List[str]:
+    """Pull the 67k human protein sequences (uniref50_distilled) into a list."""
     import pandas as pd
-    from datasets import Dataset
 
     query = args.db_query or DEFAULT_DB_QUERY.format(subset=args.db_subset)
-    logger.info("Querying DB %s (subset=%s)", args.db_file, args.db_subset)
+    logger.info("Querying human DB %s (subset=%s)", args.db_file, args.db_subset)
     conn = sqlite3.connect(args.db_file)
     try:
         df = pd.read_sql(query, conn)
@@ -387,38 +394,144 @@ def load_db_sequences(args):
     df = df[df["sequence"].str.len() < args.db_max_length]
     if args.max_samples:
         df = df.head(args.max_samples)
-    df = df.reset_index(drop=True)
-    logger.info("Loaded %d sequences from DB", len(df))
-    return Dataset.from_pandas(df[["sequence"]], preserve_index=False)
+    logger.info("Loaded %d human sequences", len(df))
+    return df["sequence"].tolist()
 
 
-def build_dataset(args, tokenizer):
-    from datasets import Dataset
+# ============================================================================= #
+#  DYNAMIC-CROP DATASETS
+#  On-the-fly random crop to `crop_length` CORE tokens (re-rolled every epoch),
+#  with ESM-2-style boundary signalling: a BOS/EOS is added ONLY when the crop
+#  actually captures the protein's physical start/end.
+#    * full protein  (L <= W) : [BOS] + core + [EOS]            (<= W+2 tokens)
+#    * crop @ start            : [BOS] + window                 (missed the end)
+#    * crop @ end              :         window + [EOS]         (missed the start)
+#    * internal crop           :         window                 (missed both ends)
+#  Items are {'input_ids': [...]}; the MLM collator pads + builds labels. Because
+#  the crop is random per access, length-grouping is disabled by the caller.
+# ============================================================================= #
+class _CropDatasetBase:
+    def __init__(self, tokenizer, crop_length: int):
+        self.tokenizer = tokenizer
+        self.W = int(crop_length)
+        self.bos = tokenizer.cls_token_id          # ESM2 BOS == <cls>
+        self.eos = tokenizer.eos_token_id
+        if self.bos is None or self.eos is None:
+            raise ValueError("Tokenizer must define cls/eos tokens for BOS/EOS.")
 
-    if args.data_source == "db":
-        raw = load_db_sequences(args)
-    else:  # fasta
+    def encode(self, seq: str) -> Dict[str, List[int]]:
+        core = self.tokenizer(seq, add_special_tokens=False,
+                              truncation=False)["input_ids"]
+        L = len(core)
+        if L <= self.W:                            # full protein -> BOS..EOS
+            ids = [self.bos] + core + [self.eos]
+        else:                                      # random window of W tokens
+            start = random.randint(0, L - self.W)
+            ids = core[start:start + self.W]
+            if start == 0:                         # captured the true start
+                ids = [self.bos] + ids
+            if start + self.W == L:                # captured the true end
+                ids = ids + [self.eos]
+        return {"input_ids": ids}
+
+
+class InMemoryCropDataset(_CropDatasetBase):
+    """For small corpora (e.g. the 67k human set) held in memory."""
+    def __init__(self, sequences: List[str], tokenizer, crop_length: int):
+        super().__init__(tokenizer, crop_length)
+        self.sequences = sequences
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        return self.encode(self.sequences[idx])
+
+
+class SqliteCropDataset(_CropDatasetBase):
+    """Lazy reader over a split table (entry_id, sequence) for full UniRef50:
+    sequences are fetched by rowid on demand, so the corpus never lives in RAM.
+    A read-only sqlite connection is (re)opened per worker process."""
+    def __init__(self, db_file: str, table: str, tokenizer, crop_length: int):
+        super().__init__(tokenizer, crop_length)
+        self.db_file, self.table = db_file, table
+        con = sqlite3.connect(db_file)
+        try:
+            mn, mx, cnt = con.execute(
+                f"SELECT MIN(rowid), MAX(rowid), COUNT(*) FROM {table}").fetchone()
+            if cnt == 0:
+                raise RuntimeError(f"Split table {table!r} in {db_file} is empty.")
+            self.n = cnt
+            self.contiguous = (mn == 1 and mx == cnt)
+            self.rowids = None
+            if not self.contiguous:                # robust fallback
+                self.rowids = np.fromiter(
+                    (r[0] for r in con.execute(f"SELECT rowid FROM {table}")),
+                    dtype=np.int64, count=cnt)
+        finally:
+            con.close()
+        self._conn = None
+        self._pid = None
+
+    def _connection(self):
+        pid = os.getpid()
+        if self._conn is None or self._pid != pid:  # per-worker connection
+            self._conn = sqlite3.connect(
+                f"file:{self.db_file}?mode=ro", uri=True, check_same_thread=False)
+            self._pid = pid
+        return self._conn
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        rowid = idx + 1 if self.contiguous else int(self.rowids[idx])
+        row = self._connection().execute(
+            f"SELECT sequence FROM {self.table} WHERE rowid=?", (rowid,)).fetchone()
+        return self.encode(row[0])
+
+
+def get_dynamic_datasets(args, tokenizer):
+    """Build (train_ds, eval_ds) torch datasets with dynamic cropping, selected
+    by --training_data: 'all' -> UniRef50 split tables (lazy); 'human'/'fasta'
+    -> in-memory corpus with a random --val_split holdout."""
+    crop = args.max_length                          # crop window = CORE tokens
+
+    if args.training_data == "all":
+        logger.info("training_data=all -> UniRef50 split tables %s/%s in %s",
+                    args.train_table, args.val_table, args.uniref_db)
+        train_ds = SqliteCropDataset(args.uniref_db, args.train_table, tokenizer, crop)
+        eval_ds = SqliteCropDataset(args.uniref_db, args.val_table, tokenizer, crop)
+        logger.info("Lazy UniRef50: train=%d val=%d sequences", len(train_ds), len(eval_ds))
+        return train_ds, eval_ds
+
+    if args.training_data == "fasta":
+        if not args.fasta:
+            raise ValueError("--training_data fasta requires --fasta PATH")
         logger.info("Reading FASTA: %s", args.fasta)
-        raw = Dataset.from_generator(
-            lambda: iter_fasta(args.fasta, args.min_length, args.max_samples))
-        logger.info("Loaded %d sequences from FASTA", len(raw))
+        seqs = [r["sequence"] for r in iter_fasta(args.fasta, args.min_length, args.max_samples)]
+        logger.info("Loaded %d sequences from FASTA", len(seqs))
+    else:  # human
+        seqs = load_human_sequences(args)
 
-    if len(raw) == 0:
-        raise RuntimeError("No sequences loaded - check the --data_source inputs.")
+    if not seqs:
+        raise RuntimeError("No sequences loaded for the in-memory pipeline.")
 
-    def tokenize(batch):
-        enc = tokenizer(batch["sequence"], truncation=True, max_length=args.max_length)
-        enc["length"] = [len(ids) for ids in enc["input_ids"]]
-        return enc
+    if args.val_split and args.val_split > 0 and len(seqs) > 1:
+        rng = random.Random(args.seed)
+        idx = list(range(len(seqs)))
+        rng.shuffle(idx)
+        n_val = max(1, int(len(seqs) * args.val_split))
+        val_seqs = [seqs[i] for i in idx[:n_val]]
+        train_seqs = [seqs[i] for i in idx[n_val:]]
+    else:
+        train_seqs, val_seqs = seqs, []
 
-    tokenized = raw.map(
-        tokenize, batched=True, num_proc=args.preprocessing_num_workers,
-        remove_columns=raw.column_names, desc="Tokenizing")
-
-    if args.val_split and args.val_split > 0:
-        split = tokenized.train_test_split(test_size=args.val_split, seed=args.seed)
-        return split["train"], split["test"]
-    return tokenized, None
+    train_ds = InMemoryCropDataset(train_seqs, tokenizer, crop)
+    eval_ds = InMemoryCropDataset(val_seqs, tokenizer, crop) if val_seqs else None
+    logger.info("In-memory split (%s) -> train=%d val=%d",
+                args.training_data, len(train_seqs), len(val_seqs))
+    return train_ds, eval_ds
 
 
 # ============================================================================= #
@@ -653,20 +766,37 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     # data
+    p.add_argument("--training_data", default=None, choices=["human", "all", "fasta"],
+                   help="Training corpus: 'human' = 67k human set (human DB, in "
+                        "memory); 'all' = full UniRef50 split tables (lazy); "
+                        "'fasta' = a FASTA file. Default: derived from --data_source.")
     p.add_argument("--data_source", default="fasta", choices=["fasta", "db"],
-                   help="Where training sequences come from.")
-    p.add_argument("--fasta", default=None, help="FASTA path (required if --data_source fasta).")
-    p.add_argument("--db_file", default=DEFAULT_DB_FILE, help="SQLite DB (--data_source db).")
+                   help="[legacy] fasta/db; only used when --training_data is unset "
+                        "(db -> human, fasta -> fasta).")
+    p.add_argument("--fasta", default=None, help="FASTA path (--training_data fasta).")
+    p.add_argument("--db_file", default=DEFAULT_DB_FILE,
+                   help="Human SQLite DB (--training_data human).")
     p.add_argument("--db_subset", default="uniref50", choices=["uniref50", "uniref90"],
-                   help="Selects the <subset>_distilled table in the default query.")
+                   help="Selects the <subset>_distilled table in the default human query.")
     p.add_argument("--db_query", default=None,
-                   help="Custom SQL overriding the default; must return a 'sequence' column.")
+                   help="Custom SQL overriding the default human query; must return a 'sequence' column.")
     p.add_argument("--db_max_length", type=int, default=1000,
-                   help="Keep DB sequences with residue length < this.")
+                   help="Keep human-DB sequences with residue length < this.")
+    # --- full UniRef50 split tables (--training_data all) --- #
+    p.add_argument("--uniref_db",
+                   default="/cta/share/users/uniprot/uniref/uniref_2024_06/uniref50_representatives.db",
+                   help="SQLite DB holding the plm_train/plm_validation split tables.")
+    p.add_argument("--train_table", default="plm_train",
+                   help="Train split table (entry_id, sequence) for --training_data all.")
+    p.add_argument("--val_table", default="plm_validation",
+                   help="Validation split table for --training_data all.")
     p.add_argument("--min_length", type=int, default=1)
     p.add_argument("--max_length", type=int, default=1024,
-                   help="Max TOTAL tokens per example incl. <cls>/<eos> (ESM2 = 1024).")
-    p.add_argument("--val_split", type=float, default=0.01)
+                   help="Random-crop window in CORE tokens (BOS/EOS added on top; "
+                        "ESM2 = 1024, fits the model's 1026 positions).")
+    p.add_argument("--val_split", type=float, default=0.01,
+                   help="Holdout fraction for in-memory corpora (human/fasta); "
+                        "ignored for 'all' (uses the plm_validation table).")
     p.add_argument("--max_samples", type=int, default=None, help="Cap #sequences (debug).")
     p.add_argument("--preprocessing_num_workers", type=int, default=4)
 
@@ -968,8 +1098,18 @@ def main():
     from transformers import DataCollatorForLanguageModeling, set_seed
     set_seed(args.seed)
 
-    if args.data_source == "fasta" and not args.fasta:
-        raise ValueError("--data_source fasta requires --fasta PATH")
+    # resolve the training corpus (back-compat: derive from legacy --data_source)
+    if args.training_data is None:
+        args.training_data = "fasta" if args.data_source == "fasta" else "human"
+        logger.info("--training_data not set -> '%s' (from --data_source=%s)",
+                    args.training_data, args.data_source)
+    if args.training_data == "fasta" and not args.fasta:
+        raise ValueError("--training_data fasta requires --fasta PATH")
+    # dynamic random cropping makes precomputed lengths meaningless and a lazy
+    # full pass over UniRef50 untenable -> disable length grouping.
+    if args.group_by_length:
+        logger.info("Disabling group_by_length (incompatible with dynamic cropping).")
+        args.group_by_length = False
 
     slug = build_run_slug(args)
     if not args.output_dir:
@@ -992,7 +1132,7 @@ def main():
     # --- build the pieces --------------------------------------------------- #
     ref_tokenizer = load_reference_tokenizer(args.offline)   # real ESM2 tokenizer
     tokenizer = build_tokenizer(args)
-    train_ds, eval_ds = build_dataset(args, tokenizer)
+    train_ds, eval_ds = get_dynamic_datasets(args, tokenizer)
     model, adapt_stats = build_model(args, tokenizer, ref_tokenizer)
     if args.gradient_checkpointing:
         model.config.use_cache = False
