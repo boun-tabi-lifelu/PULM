@@ -20,15 +20,23 @@ Pipeline (run ONCE; the result is persisted as two new tables)
                  (entry_id, sequence), and CREATE an INDEX on entry_id for both.
 
 Because MMseqs2 only consumes FASTA, the splits are dumped to temporary FASTA
-files, MMseqs2 is invoked via its CLI, the m8 hit table is parsed, and the
-temporary files (FASTA + MMseqs2 tmp/result dirs) are cleaned up at the end.
+files (one streaming pass over the source table), MMseqs2 is invoked via its
+CLI, the m8 hit table is parsed, and the temporary files (FASTA + MMseqs2
+tmp/result dirs) are cleaned up at the end.
+
+GPU acceleration (default): with a GPU-enabled MMseqs2 build the homology search
+runs on a single GPU (the small validation set is built into a padded GPU
+database; the huge train query is streamed through the GPU prefilter). The
+device is pinned via CUDA_VISIBLE_DEVICES (--gpu_devices, default '0' = first
+GPU). Pass --no_gpu to fall back to CPU `easy-search`.
 
 Example
 -------
+    # GPU on the first device, all CPU threads for alignment/IO
     python scripts/prepare_uniref50_splits.py \
         --db /cta/share/users/uniprot/uniref/uniref_2024_06/uniref50_representatives.db \
         --source_table uniref50_representatives \
-        --threads 32 --tmp_dir /scratch/$USER/mmseqs_tmp
+        --gpu_devices 0 --threads 256 --tmp_dir /scratch/$USER/mmseqs_tmp
 
 Re-running is safe: pass --overwrite to drop existing plm_train/plm_validation.
 Use --limit N for a quick end-to-end smoke test on N source rows.
@@ -71,7 +79,7 @@ def parse_args():
                    help="Drop existing train/val tables before writing.")
     # partition
     p.add_argument("--val_frac", type=float, default=0.005,
-                   help="Fraction held out for validation (ESM-2 used ~0.5%).")
+                   help="Fraction held out for validation (ESM-2 used ~0.5%%).")
     p.add_argument("--val_size", type=int, default=None,
                    help="Absolute validation size; overrides --val_frac if set.")
     p.add_argument("--seed", type=int, default=42)
@@ -79,7 +87,15 @@ def parse_args():
                    help="Debug: only consider the first N source rows.")
     # mmseqs
     p.add_argument("--mmseqs", default="mmseqs", help="MMseqs2 binary / path.")
-    p.add_argument("--threads", type=int, default=max(1, os.cpu_count() or 1))
+    p.add_argument("--threads", type=int, default=max(1, os.cpu_count() or 1),
+                   help="CPU threads (defaults to all logical CPUs).")
+    # GPU acceleration (requires a GPU-enabled MMseqs2 build)
+    p.add_argument("--gpu", dest="gpu", action="store_true", default=True,
+                   help="Use GPU-accelerated MMseqs2 (default; needs a GPU build).")
+    p.add_argument("--no_gpu", dest="gpu", action="store_false",
+                   help="Force CPU MMseqs2 (easy-search) instead.")
+    p.add_argument("--gpu_devices", default="0",
+                   help="CUDA device(s) exposed to MMseqs2 (default: first GPU only).")
     p.add_argument("--tmp_dir", default=None,
                    help="Working dir for FASTA + MMseqs2 tmp (default: system temp).")
     p.add_argument("--identity_cutoff", type=float, default=0.5,
@@ -87,7 +103,7 @@ def parse_args():
     p.add_argument("--min_seq_id", default="0.5")
     p.add_argument("--alignment_mode", default="3")
     p.add_argument("--max_seqs", default="300")
-    p.add_argument("--sensitivity", default="7", help="MMseqs2 -s.")
+    p.add_argument("--sensitivity", default="7", help="MMseqs2 -s (CPU prefilter).")
     p.add_argument("--coverage", default="0.8", help="MMseqs2 -c.")
     p.add_argument("--cov_mode", default="0")
     p.add_argument("--skip_homology", action="store_true",
@@ -107,70 +123,60 @@ def table_exists(conn, name: str) -> bool:
     return row is not None
 
 
-def source_rowids(conn, table: str, limit) -> np.ndarray:
-    """Return the source rowids to split (fast contiguous path when possible)."""
+def choose_val_rowids(conn, table: str, val_frac: float, val_size_arg,
+                      limit, seed: int):
+    """Pick the validation rowids without materialising the whole table.
+    Returns (n_considered, val_size, val_rowids:set)."""
     mn, mx, cnt = conn.execute(
         f"SELECT MIN(rowid), MAX(rowid), COUNT(*) FROM {table}").fetchone()
     if cnt == 0:
         raise RuntimeError(f"Source table {table!r} is empty.")
-    if mn == 1 and mx == cnt:                       # contiguous 1..N
-        rowids = np.arange(1, cnt + 1, dtype=np.int64)
-    else:
-        logger.info("Non-contiguous rowids; loading the full rowid list ...")
-        rowids = np.fromiter(
-            (r[0] for r in conn.execute(f"SELECT rowid FROM {table}")),
-            dtype=np.int64, count=cnt)
-    if limit:
-        rowids = rowids[:limit]
-    return rowids
+    n = min(cnt, limit) if limit else cnt
+    contiguous = (mn == 1 and mx == cnt)
+    val_size = val_size_arg if val_size_arg is not None else int(round(n * val_frac))
+    val_size = max(1, min(val_size, n - 1))
 
-
-def stream_rows(conn, table: str, rowids: np.ndarray, batch: int = 50_000
-                ) -> Iterator[Tuple[int, str, str]]:
-    """Yield (rowid, entry_id, sequence) for the given rowids, in batches."""
-    cur = conn.cursor()
-    for i in range(0, len(rowids), batch):
-        chunk = rowids[i:i + batch].tolist()
-        qmarks = ",".join("?" * len(chunk))
-        cur.execute(
-            f"SELECT rowid, entry_id, sequence FROM {table} "
-            f"WHERE rowid IN ({qmarks})", chunk)
-        for row in cur.fetchall():
-            yield row
+    rng = np.random.default_rng(seed)
+    if contiguous:                                   # rowids are 1..cnt
+        val_rowids = set((rng.choice(n, val_size, replace=False) + 1).tolist())
+    else:                                            # need the actual rowids
+        logger.info("Non-contiguous rowids; loading the rowid list ...")
+        sql = f"SELECT rowid FROM {table}" + (f" LIMIT {int(limit)}" if limit else "")
+        rowids = np.fromiter((r[0] for r in conn.execute(sql)), dtype=np.int64, count=n)
+        pos = rng.choice(n, val_size, replace=False)
+        val_rowids = set(rowids[pos].tolist())
+    return n, val_size, val_rowids
 
 
 # --------------------------------------------------------------------------- #
-#  STEP 1 -- PARTITION + dump FASTA
+#  STEP 1 -- PARTITION + dump FASTA  (single streaming scan over the source)
 # --------------------------------------------------------------------------- #
-def write_fasta_handle(fh, entry_id: str, sequence: str):
-    fh.write(f">{entry_id}\n{sequence}\n")
-
-
 def partition_and_dump(conn, args, work_dir: str):
     """Choose the validation rowids, dump train/val FASTA, return paths + counts."""
-    rowids = source_rowids(conn, args.source_table, args.limit)
-    n = len(rowids)
-    val_size = args.val_size if args.val_size is not None else int(round(n * args.val_frac))
-    val_size = max(1, min(val_size, n - 1))
+    n, val_size, val_rowids = choose_val_rowids(
+        conn, args.source_table, args.val_frac, args.val_size, args.limit, args.seed)
     logger.info("Source rows: %d | validation: %d | train (pre-homology): %d",
                 n, val_size, n - val_size)
 
-    rng = np.random.default_rng(args.seed)
-    val_pos = rng.choice(n, size=val_size, replace=False)
-    val_rowids: Set[int] = set(rowids[val_pos].tolist())
-
     train_fa = os.path.join(work_dir, "train.fasta")
     val_fa = os.path.join(work_dir, "val.fasta")
+    sql = f"SELECT rowid, entry_id, sequence FROM {args.source_table}"
+    if args.limit:
+        sql += f" LIMIT {int(args.limit)}"
+
     n_train = n_val = 0
     t0 = time.time()
-    with open(train_fa, "w") as ftr, open(val_fa, "w") as fva:
-        for rowid, entry_id, seq in stream_rows(conn, args.source_table, rowids):
+    cur = conn.cursor()
+    cur.execute(sql)
+    with open(train_fa, "w", buffering=1 << 20) as ftr, \
+            open(val_fa, "w", buffering=1 << 20) as fva:
+        for rowid, entry_id, seq in cur:            # cursor streams row by row
             if not seq:
                 continue
             if rowid in val_rowids:
-                write_fasta_handle(fva, entry_id, seq); n_val += 1
+                fva.write(f">{entry_id}\n{seq}\n"); n_val += 1
             else:
-                write_fasta_handle(ftr, entry_id, seq); n_train += 1
+                ftr.write(f">{entry_id}\n{seq}\n"); n_train += 1
     logger.info("Dumped FASTA in %.1fs -> train=%d val=%d (%s, %s)",
                 time.time() - t0, n_train, n_val, train_fa, val_fa)
     return train_fa, val_fa, n_train, n_val
@@ -179,15 +185,28 @@ def partition_and_dump(conn, args, work_dir: str):
 # --------------------------------------------------------------------------- #
 #  STEP 2 -- MMseqs2 homology search train(query) vs val(target)
 # --------------------------------------------------------------------------- #
+def _run(cmd, env):
+    import subprocess
+    logger.info("  $ %s", " ".join(map(str, cmd)))
+    t0 = time.time()
+    rc = subprocess.run(cmd, env=env).returncode
+    if rc != 0:
+        raise RuntimeError(f"MMseqs2 step failed (exit {rc}): {' '.join(map(str, cmd))}")
+    logger.info("    done in %.1fs", time.time() - t0)
+
+
 def run_mmseqs(args, train_fa: str, val_fa: str, work_dir: str) -> Set[str]:
-    """Return the set of TRAIN entry_ids that hit a VAL seq at >= cutoff identity."""
+    """Return the set of TRAIN entry_ids that hit a VAL seq at >= cutoff identity.
+
+    Search direction: query = TRAIN, target = VALIDATION. With --gpu the small
+    validation target is built into a padded GPU database and the (huge) train
+    query is streamed through the GPU prefilter on the first device only."""
     result_m8 = os.path.join(work_dir, "train_vs_val.m8")
     mmseqs_tmp = os.path.join(work_dir, "mmseqs_tmp")
     os.makedirs(mmseqs_tmp, exist_ok=True)
 
-    # easy-search consumes FASTA directly: query=train, target=val.
-    cmd = [
-        args.mmseqs, "easy-search", train_fa, val_fa, result_m8, mmseqs_tmp,
+    # shared search parameters (per Meier et al.)
+    search_params = [
         "--min-seq-id", str(args.min_seq_id),
         "--alignment-mode", str(args.alignment_mode),
         "--max-seqs", str(args.max_seqs),
@@ -195,16 +214,32 @@ def run_mmseqs(args, train_fa: str, val_fa: str, work_dir: str) -> Set[str]:
         "-c", str(args.coverage),
         "--cov-mode", str(args.cov_mode),
         "--threads", str(args.threads),
-        # m8 cols: query target fident alnlen mismatch gapopen qstart qend tstart tend evalue bits
-        "--format-output", "query,target,fident",
     ]
-    logger.info("Running MMseqs2:\n  %s", " ".join(cmd))
-    import subprocess
+    fmt = ["--format-output", "query,target,fident"]
+
+    env = dict(os.environ)
     t0 = time.time()
-    proc = subprocess.run(cmd)
-    if proc.returncode != 0:
-        raise RuntimeError(f"MMseqs2 failed (exit {proc.returncode}). "
-                           f"Check that '{args.mmseqs}' is installed and on PATH.")
+    if args.gpu:
+        env["CUDA_VISIBLE_DEVICES"] = str(args.gpu_devices)
+        logger.info("GPU-accelerated MMseqs2 (CUDA_VISIBLE_DEVICES=%s, threads=%d)",
+                    args.gpu_devices, args.threads)
+        query_db = os.path.join(work_dir, "queryDB")     # train
+        target_db = os.path.join(work_dir, "targetDB")   # val
+        target_gpu = os.path.join(work_dir, "targetDB_gpu")
+        result_db = os.path.join(work_dir, "resultDB")
+        _run([args.mmseqs, "createdb", train_fa, query_db], env)
+        _run([args.mmseqs, "createdb", val_fa, target_db], env)
+        # pad the (small) validation target for the GPU prefilter
+        _run([args.mmseqs, "makepaddedseqdb", target_db, target_gpu], env)
+        _run([args.mmseqs, "search", query_db, target_gpu, result_db, mmseqs_tmp,
+              "--gpu", "1"] + search_params, env)
+        _run([args.mmseqs, "convertalis", query_db, target_gpu, result_db, result_m8]
+             + fmt + ["--threads", str(args.threads)], env)
+    else:
+        logger.info("CPU MMseqs2 easy-search (threads=%d)", args.threads)
+        # easy-search consumes FASTA directly: query=train, target=val.
+        _run([args.mmseqs, "easy-search", train_fa, val_fa, result_m8, mmseqs_tmp]
+             + search_params + fmt, env)
     logger.info("MMseqs2 finished in %.1fs -> %s", time.time() - t0, result_m8)
 
     to_remove: Set[str] = set()
