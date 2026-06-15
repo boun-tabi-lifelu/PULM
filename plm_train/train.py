@@ -136,7 +136,7 @@ ESM2_SPECIALS = {
 #  Layout: {tokenizer_dir}/{subs_matrix}/hf_{filename}.json
 #          (BPE always lives under the 'blosum62' subfolder.)
 # ============================================================================= #
-DEFAULT_TOKENIZER_DIR = "/cta/share/users/mutbpe/tokenizers"
+DEFAULT_TOKENIZER_DIR = "/cta/share/users/mutbpe/tokenizers/uniref50_2024_06"
 
 # --- protein DB (SQLite) defaults ------------------------------------------- #
 DEFAULT_DB_FILE = "/cta/share/users/uniprot/human/human.db"
@@ -172,7 +172,7 @@ def resolve_tokenizer_path(args) -> str:
     if args.tokenizer_file:                      # explicit override wins
         return args.tokenizer_file
     is_mut = args.tokenizer_type.lower() == "puma"
-    subfolder = args.subs_matrix if is_mut else "blosum62"
+    subfolder = args.subs_matrix if is_mut else "bpe"
     fname = _tokenizer_filename(args, is_mut)
     return os.path.join(args.tokenizer_dir, subfolder, f"hf_{fname}.json")
 
@@ -190,7 +190,7 @@ def build_run_slug(args) -> str:
         tok = f"BPE_{args.vocab_size}"
     else:  # aa
         tok = "AA"
-    return f"ESM2_{size}_{tok}"
+    return f"ESM2_{size}_{tok}_{args.training_data}"
 
 
 # ============================================================================= #
@@ -719,9 +719,9 @@ def parse_args():
     p.add_argument("--mlm_probability", type=float, default=0.15)
 
     # optimisation (ESM2-flavoured defaults)
-    p.add_argument("--per_device_train_batch_size", type=int, default=128)
-    p.add_argument("--per_device_eval_batch_size", type=int, default=128)
-    p.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    p.add_argument("--per_device_train_batch_size", type=int, default=16)
+    p.add_argument("--per_device_eval_batch_size", type=int, default=16)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=8)
     p.add_argument("--learning_rate", type=float, default=4e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--adam_beta1", type=float, default=0.9)
@@ -745,10 +745,10 @@ def parse_args():
     # logging / checkpointing
     p.add_argument("--output_dir", default=None,
                    help="Defaults to the auto run name, e.g. ESM2_8M_PUMA_blosum62_07_005_51200.")
-    p.add_argument("--logging_steps", type=int, default=100)
-    p.add_argument("--eval_steps", type=int, default=500)
-    p.add_argument("--save_steps", type=int, default=2000)
-    p.add_argument("--save_total_limit", type=int, default=1)
+    p.add_argument("--logging_steps", type=int, default=5000)
+    p.add_argument("--eval_steps", type=int, default=25000)
+    p.add_argument("--save_steps", type=int, default=25000)
+    p.add_argument("--save_total_limit", type=int, default=3)
     p.add_argument("--resume_from_checkpoint", default=None)
     p.add_argument("--seed", type=int, default=42)
 

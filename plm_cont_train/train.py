@@ -195,7 +195,7 @@ def resolve_tokenizer_path(args) -> str:
     if args.tokenizer_file:                      # explicit override wins
         return args.tokenizer_file
     is_mut = args.tokenizer_type.lower() == "puma"
-    subfolder = args.subs_matrix if is_mut else "blosum62"
+    subfolder = args.subs_matrix if is_mut else "bpe"
     fname = _tokenizer_filename(args, is_mut)
     return os.path.join(args.tokenizer_dir, subfolder, f"hf_{fname}.json")
 
@@ -217,6 +217,7 @@ def build_run_slug(args) -> str:
     slug = f"ESM2_{size}_{tok}_{args.embedding_init}"
     if getattr(args, "two_stage", False):
         slug += "_TS"   # Two-Stage freeze-and-train
+    slug += f"_{args.training_data}"
     return slug
 
 
@@ -894,7 +895,7 @@ def parse_args():
     p.add_argument("--logging_steps", type=int, default=100)
     p.add_argument("--eval_steps", type=int, default=500)
     p.add_argument("--save_steps", type=int, default=2000)
-    p.add_argument("--save_total_limit", type=int, default=1)
+    p.add_argument("--save_total_limit", type=int, default=3)
     p.add_argument("--resume_from_checkpoint", default=None)
     p.add_argument("--seed", type=int, default=42)
 
