@@ -896,7 +896,9 @@ def parse_args():
     p.add_argument("--eval_steps", type=int, default=500)
     p.add_argument("--save_steps", type=int, default=2000)
     p.add_argument("--save_total_limit", type=int, default=3)
-    p.add_argument("--resume_from_checkpoint", default=None)
+    p.add_argument("--resume_from_checkpoint", default=None,
+                   help="Checkpoint dir to resume from, or 'true'/'latest' to pick "
+                        "the newest checkpoint in --output_dir.")
     p.add_argument("--seed", type=int, default=42)
 
     # post-training sanity check (before vs after)
@@ -914,6 +916,12 @@ def parse_args():
     p.add_argument("--wandb_group", default=None, help="Group runs (e.g. by model size).")
     p.add_argument("--wandb_mode", default="online",
                    choices=["online", "offline", "disabled"])
+    p.add_argument("--wandb_run_id", default=None,
+                   help="Continue THIS existing wandb run id (use together with "
+                        "--resume_from_checkpoint to merge into the same run).")
+    p.add_argument("--wandb_resume", default="allow",
+                   choices=["allow", "must", "never", "auto"],
+                   help="wandb resume mode when --wandb_run_id is set.")
 
     return p.parse_args()
 
@@ -1018,6 +1026,30 @@ def sanity_check(orig_name, trained_dir, sequences, topk, max_length, offline):
 
 
 # ============================================================================= #
+#  RESUME FIX
+#  In recent transformers, TrainerState stores logging_steps/eval_steps/
+#  save_steps, and `TrainerState.load_from_json()` on resume OVERWRITES the
+#  values you pass on the CLI with the ones baked into the checkpoint. So after
+#  resuming, the cadence silently reverts to the checkpoint's old schedule.
+#  on_train_begin runs AFTER the state is loaded -> re-assert the current args.
+# ============================================================================= #
+def make_resume_step_override_callback():
+    from transformers import TrainerCallback
+
+    class ResumeStepOverride(TrainerCallback):
+        def on_train_begin(self, args, state, control, **kwargs):
+            state.logging_steps = args.logging_steps
+            state.eval_steps = args.eval_steps
+            state.save_steps = args.save_steps
+            logger.info("Re-asserted schedule after resume: logging_steps=%s "
+                        "eval_steps=%s save_steps=%s",
+                        args.logging_steps, args.eval_steps, args.save_steps)
+            return control
+
+    return ResumeStepOverride()
+
+
+# ============================================================================= #
 #  TRAINER FACTORY  (shared by single-stage and the two-stage strategy)
 # ============================================================================= #
 def build_trainer(args, model, tokenizer, train_ds, eval_ds, collator, *,
@@ -1056,7 +1088,8 @@ def build_trainer(args, model, tokenizer, train_ds, eval_ds, collator, *,
 
     # Trainer renamed `tokenizer` -> `processing_class` in transformers 4.46+.
     trainer_kwargs = dict(model=model, args=training_args, train_dataset=train_ds,
-                          eval_dataset=eval_ds, data_collator=collator)
+                          eval_dataset=eval_ds, data_collator=collator,
+                          callbacks=[make_resume_step_override_callback()])
     if "processing_class" in inspect.signature(Trainer.__init__).parameters:
         trainer_kwargs["processing_class"] = tokenizer
     else:
@@ -1112,6 +1145,12 @@ def main():
         logger.info("Disabling group_by_length (incompatible with dynamic cropping).")
         args.group_by_length = False
 
+    # normalise --resume_from_checkpoint: accept 'true'/'latest'/'auto' -> True
+    # (let the Trainer auto-pick the newest checkpoint in --output_dir).
+    if isinstance(args.resume_from_checkpoint, str) and \
+            args.resume_from_checkpoint.lower() in {"true", "1", "latest", "auto"}:
+        args.resume_from_checkpoint = True
+
     slug = build_run_slug(args)
     if not args.output_dir:
         args.output_dir = slug
@@ -1125,6 +1164,16 @@ def main():
             os.environ["WANDB_ENTITY"] = args.wandb_entity
         if args.wandb_group:
             os.environ["WANDB_RUN_GROUP"] = args.wandb_group
+        # Continue the SAME wandb run when given an id (merge with predecessor).
+        if args.wandb_run_id:
+            os.environ["WANDB_RUN_ID"] = args.wandb_run_id
+            os.environ["WANDB_RESUME"] = args.wandb_resume
+            logger.info("Continuing wandb run id=%s (resume=%s)",
+                        args.wandb_run_id, args.wandb_resume)
+        elif args.resume_from_checkpoint:
+            logger.warning("Resuming training but --wandb_run_id was not given: "
+                           "wandb will start a NEW run. Pass --wandb_run_id <id> "
+                           "to append to the original run.")
         report_to = ["wandb"]
         run_name = args.wandb_run_name or slug
     else:
@@ -1153,6 +1202,11 @@ def main():
     if args.two_stage:
         if args.resume_from_checkpoint:
             logger.warning("--resume_from_checkpoint is ignored in --two_stage mode.")
+        if args.wandb_run_id:                       # one id can't span 2 stage runs
+            logger.warning("--wandb_run_id is ignored in --two_stage mode "
+                           "(each stage is its own run).")
+            os.environ.pop("WANDB_RUN_ID", None)
+            os.environ.pop("WANDB_RESUME", None)
         total = args.num_train_epochs
         s1 = args.stage1_epochs if args.stage1_epochs is not None else args.stage1_ratio * total
         s1 = max(0.0, min(round(s1, 6), total))
