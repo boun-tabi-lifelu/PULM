@@ -520,6 +520,26 @@ def _manual_config(args):
     )
 
 
+def init_esm_from_config(config, attn_impl: str):
+    """Random-init EsmForMaskedLM with a requested attention impl, falling back
+    to eager if the installed transformers/ESM build doesn't support it."""
+    from transformers import EsmForMaskedLM
+    candidates = [attn_impl, "eager"] if attn_impl != "eager" else ["eager"]
+    for impl in candidates:
+        try:
+            m = EsmForMaskedLM._from_config(config, attn_implementation=impl)
+            logger.info("Attention implementation: %s", impl)
+            return m
+        except TypeError:                         # old API: no attn kwarg here
+            config._attn_implementation = impl
+            logger.info("Attention implementation: %s (via config)", impl)
+            return EsmForMaskedLM(config)
+        except (ValueError, ImportError, RuntimeError) as e:
+            logger.warning("attn_implementation=%s unavailable (%s); trying eager.",
+                           impl, e)
+    return EsmForMaskedLM(config)
+
+
 def build_model(args, tokenizer):
     from transformers import EsmConfig, EsmForMaskedLM
 
@@ -552,7 +572,7 @@ def build_model(args, tokenizer):
                        "=%d). Reduce --max_length or it will error at runtime.",
                        args.max_length, config.max_position_embeddings)
 
-    model = EsmForMaskedLM(config)   # random init -> trained from scratch
+    model = init_esm_from_config(config, args.attn_implementation)  # random init
     n = sum(p.numel() for p in model.parameters())
     logger.info("ESM2 [%s | config=%s]: layers=%d hidden=%d heads=%d ffn=%d "
                 "max_pos=%d vocab=%d -> %.1fM params",
@@ -712,6 +732,10 @@ def parse_args():
     p.add_argument("--num_attention_heads", type=int, default=20)
     p.add_argument("--intermediate_size", type=int, default=None)
     p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--attn_implementation", default="sdpa",
+                   choices=["sdpa", "eager", "flash_attention_2"],
+                   help="Attention kernel; sdpa is faster + lower memory (auto-"
+                        "falls back to eager if unsupported).")
     p.add_argument("--offline", action="store_true",
                    help="Don't touch the Hub; use built-in ESM2 shapes/vocab.")
 
@@ -733,6 +757,9 @@ def parse_args():
     p.add_argument("--warmup_ratio", type=float, default=0.02)
     p.add_argument("--warmup_steps", type=int, default=0)
     p.add_argument("--lr_scheduler_type", default="cosine")
+    p.add_argument("--optim", default="adamw_torch_fused",
+                   help="HF optimizer (e.g. adamw_torch_fused, adamw_torch, "
+                        "adamw_bnb_8bit). Fused is faster on CUDA.")
 
     # hardware / efficiency
     p.add_argument("--precision", default="auto", choices=["auto", "bf16", "fp16", "no"])
@@ -957,7 +984,7 @@ def main():
         adam_beta1=args.adam_beta1, adam_beta2=args.adam_beta2,
         adam_epsilon=args.adam_epsilon, max_grad_norm=args.max_grad_norm,
         warmup_steps=warmup_steps,
-        lr_scheduler_type=args.lr_scheduler_type,
+        lr_scheduler_type=args.lr_scheduler_type, optim=args.optim,
         fp16=fp16, bf16=bf16, gradient_checkpointing=args.gradient_checkpointing,
         group_by_length=args.group_by_length, length_column_name="length",
         dataloader_num_workers=args.dataloader_num_workers,

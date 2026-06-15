@@ -622,14 +622,28 @@ def adapt_vocab_layers(model, ref_tokenizer, new_tokenizer, mode, new_token_init
     return stats
 
 
-def build_model(args, tokenizer, ref_tokenizer):
+def load_pretrained_esm(name: str, attn_impl: str):
+    """from_pretrained with a requested attention impl; fall back to eager if the
+    installed transformers/ESM build doesn't support it (e.g. sdpa)."""
     from transformers import EsmForMaskedLM
+    try:
+        m = EsmForMaskedLM.from_pretrained(name, attn_implementation=attn_impl)
+        logger.info("Attention implementation: %s", attn_impl)
+        return m
+    except (ValueError, ImportError, RuntimeError) as e:
+        if attn_impl == "eager":
+            raise
+        logger.warning("attn_implementation=%s unavailable (%s); falling back to "
+                       "eager.", attn_impl, e)
+        return EsmForMaskedLM.from_pretrained(name, attn_implementation="eager")
 
+
+def build_model(args, tokenizer, ref_tokenizer):
     name = args.pretrained_name or ESM2_HF_NAMES.get(args.model_size)
     if not name:
         raise ValueError("Provide --model_size (8M/35M/150M/650M) or --pretrained_name.")
     logger.info("Loading pretrained ESM2 weights from %s", name)
-    model = EsmForMaskedLM.from_pretrained(name)
+    model = load_pretrained_esm(name, args.attn_implementation)
 
     # AA tokenizer == ESM2 tokenizer: identical vocab + id order, reuse as-is.
     same_as_esm = (args.tokenizer_type.lower() == "aa"
@@ -840,6 +854,10 @@ def parse_args():
                         "mean of constituent residue embeddings / random / copy <unk>.")
     p.add_argument("--dropout", type=float, default=None,
                    help="Override hidden/attention dropout (default: keep ESM2's).")
+    p.add_argument("--attn_implementation", default="sdpa",
+                   choices=["sdpa", "eager", "flash_attention_2"],
+                   help="Attention kernel; sdpa is faster + lower memory (auto-"
+                        "falls back to eager if unsupported).")
     p.add_argument("--offline", action="store_true",
                    help="Don't touch the Hub; use cached weights + built-in specials.")
 
@@ -863,6 +881,9 @@ def parse_args():
     p.add_argument("--warmup_ratio", type=float, default=0.05)
     p.add_argument("--warmup_steps", type=int, default=0)
     p.add_argument("--lr_scheduler_type", default="cosine")
+    p.add_argument("--optim", default="adamw_torch_fused",
+                   help="HF optimizer (e.g. adamw_torch_fused, adamw_torch, "
+                        "adamw_bnb_8bit). Fused is faster on CUDA.")
 
     # two-stage freeze-and-train (recommended for new bpe/puma tokenizers)
     p.add_argument("--two_stage", action="store_true",
@@ -1071,6 +1092,7 @@ def build_trainer(args, model, tokenizer, train_ds, eval_ds, collator, *,
         adam_beta1=args.adam_beta1, adam_beta2=args.adam_beta2,
         adam_epsilon=args.adam_epsilon, max_grad_norm=args.max_grad_norm,
         warmup_steps=warmup_steps, lr_scheduler_type=args.lr_scheduler_type,
+        optim=args.optim,
         fp16=fp16, bf16=bf16, gradient_checkpointing=args.gradient_checkpointing,
         group_by_length=args.group_by_length, length_column_name="length",
         dataloader_num_workers=args.dataloader_num_workers,
