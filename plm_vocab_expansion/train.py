@@ -1297,11 +1297,6 @@ def main():
     if args.gradient_checkpointing:
         model.config.use_cache = False
 
-    # All hub downloads are done; go offline so PEFT's per-checkpoint base-config
-    # lookup hits the local cache instead of the hub at every save step.
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
     collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer, mlm=True, mlm_probability=args.mlm_probability,
         pad_to_multiple_of=8)
