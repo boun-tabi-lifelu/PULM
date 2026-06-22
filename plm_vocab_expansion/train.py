@@ -45,6 +45,7 @@ Example
 """
 
 import argparse
+import dataclasses
 import glob
 import inspect
 import json
@@ -915,6 +916,36 @@ def resolve_precision(choice):
     return torch.cuda.is_available(), False
 
 
+# ============================================================================= #
+#  VERSION-ROBUST TrainingArguments  (mirrors plm_train / plm_cont_train)
+#  Field names drift across transformers releases (e.g. `group_by_length` became
+#  `train_sampling_strategy="group_by_length"` in v5). Map known renames, then
+#  drop anything the installed version doesn't accept.
+# ============================================================================= #
+def make_training_args(TrainingArguments, kwargs: dict):
+    valid = {f.name for f in dataclasses.fields(TrainingArguments) if f.init}
+    kwargs = dict(kwargs)
+
+    if "group_by_length" in kwargs and "group_by_length" not in valid:
+        grouped = kwargs.pop("group_by_length")
+        if "train_sampling_strategy" in valid:
+            kwargs["train_sampling_strategy"] = "group_by_length" if grouped else "random"
+    if "train_sampling_strategy" in kwargs and "train_sampling_strategy" not in valid:
+        strat = kwargs.pop("train_sampling_strategy")
+        if "group_by_length" in valid:
+            kwargs["group_by_length"] = (strat == "group_by_length")
+
+    if "eval_strategy" in kwargs and "eval_strategy" not in valid and \
+            "evaluation_strategy" in valid:
+        kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
+
+    for k in [k for k in list(kwargs) if k not in valid]:
+        logger.warning("Dropping TrainingArguments kwarg unsupported by this "
+                       "transformers version: %s", k)
+        kwargs.pop(k)
+    return TrainingArguments(**kwargs)
+
+
 def run_stage(args, name, stage_idx, model, tokenizer, train_ds, eval_ds, collator, *,
               lr_map, max_steps, output_dir, puma_lambda, reg_child, reg_parent,
               step_offset, resume_from_checkpoint, wandb_active):
@@ -941,7 +972,7 @@ def run_stage(args, name, stage_idx, model, tokenizer, train_ds, eval_ds, collat
 
     fp16, bf16 = resolve_precision(args.precision)
     do_eval = eval_ds is not None
-    ta = TrainingArguments(
+    ta_kwargs = dict(
         output_dir=output_dir, max_steps=max_steps, seed=args.seed,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
@@ -955,6 +986,7 @@ def run_stage(args, name, stage_idx, model, tokenizer, train_ds, eval_ds, collat
         save_strategy="steps", save_steps=args.save_steps,
         save_total_limit=args.save_total_limit, report_to=["none"],
         ddp_find_unused_parameters=False, remove_unused_columns=False)
+    ta = make_training_args(TrainingArguments, ta_kwargs)
 
     callbacks = [make_resume_step_override_callback(), make_full_state_save_callback()]
     if wandb_active:
