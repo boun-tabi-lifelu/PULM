@@ -55,6 +55,7 @@ import logging
 import random
 import sqlite3
 import threading
+import warnings
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -66,6 +67,14 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%H:%M:%S", level=logging.INFO)
 logger = logging.getLogger("vocab_expansion")
+
+# Quiet third-party noise: httpx logs every hub HEAD request (PEFT does one per
+# checkpoint to locate the resized embedding layer), and PEFT warns on every save
+# that it is saving the resized embeddings -- which is exactly what we want.
+for _noisy in ("httpx", "httpcore", "huggingface_hub", "urllib3", "filelock"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+warnings.filterwarnings("ignore", message=r".*save_embedding_layers.*",
+                        category=UserWarning)
 
 
 # ============================================================================= #
@@ -1287,6 +1296,11 @@ def main():
         args, tokenizer, ref_tokenizer, genealogy, counts)
     if args.gradient_checkpointing:
         model.config.use_cache = False
+
+    # All hub downloads are done; go offline so PEFT's per-checkpoint base-config
+    # lookup hits the local cache instead of the hub at every save step.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
     collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer, mlm=True, mlm_probability=args.mlm_probability,
