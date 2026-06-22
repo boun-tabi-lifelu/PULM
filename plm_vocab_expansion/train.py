@@ -1198,8 +1198,8 @@ def parse_args():
                    help="Stage-1 family-alignment regulariser weight (0 disables).")
 
     # optimisation / hardware
-    p.add_argument("--per_device_train_batch_size", type=int, default=64)
-    p.add_argument("--per_device_eval_batch_size", type=int, default=64)
+    p.add_argument("--per_device_train_batch_size", type=int, default=128)
+    p.add_argument("--per_device_eval_batch_size", type=int, default=128)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--adam_beta1", type=float, default=0.9)
@@ -1220,9 +1220,9 @@ def parse_args():
 
     # logging / io
     p.add_argument("--output_dir", default=None)
-    p.add_argument("--logging_steps", type=int, default=100)
-    p.add_argument("--eval_steps", type=int, default=1000)
-    p.add_argument("--save_steps", type=int, default=2000)
+    p.add_argument("--logging_steps", type=int, default=5000)
+    p.add_argument("--eval_steps", type=int, default=25000)
+    p.add_argument("--save_steps", type=int, default=25000)
     p.add_argument("--save_total_limit", type=int, default=3)
     p.add_argument("--resume_from_checkpoint", default=None,
                    help="Any value enables stage-aware resume: progress.json + the "
