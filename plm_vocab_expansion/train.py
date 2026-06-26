@@ -337,6 +337,9 @@ class InMemoryCropDataset(_CropDatasetBase):
     def __init__(self, sequences, tokenizer, crop_length):
         super().__init__(tokenizer, crop_length)
         self.sequences = sequences
+        # residue length per example -> free, monotonic proxy for token length;
+        # used by the length-grouped sampler (no tokenization needed).
+        self.lengths = [len(s) for s in sequences]
 
     def __len__(self):
         return len(self.sequences)
@@ -346,7 +349,7 @@ class InMemoryCropDataset(_CropDatasetBase):
 
 
 class SqliteCropDataset(_CropDatasetBase):
-    def __init__(self, db_file, table, tokenizer, crop_length):
+    def __init__(self, db_file, table, tokenizer, crop_length, with_lengths=False):
         super().__init__(tokenizer, crop_length)
         self.db_file, self.table = db_file, table
         con = sqlite3.connect(db_file)
@@ -364,6 +367,35 @@ class SqliteCropDataset(_CropDatasetBase):
                 f"SELECT rowid FROM {table}")), dtype=np.int64, count=cnt)
             con.close()
         self._conn, self._pid = None, None
+        self.lengths = self._load_lengths() if with_lengths else None
+
+    def _load_lengths(self):
+        """Per-row residue length in rowid order (aligned with __getitem__), via a
+        stored sequence_length column when present, else SQL length(sequence).
+        Cached to a .npy next to the DB so it is a one-time scan."""
+        cache = f"{self.db_file}.{self.table}.lengths.npy"
+        if os.path.isfile(cache):
+            try:
+                arr = np.load(cache)
+                if len(arr) == self.n:
+                    return arr
+            except Exception:  # noqa: BLE001
+                pass
+        con = sqlite3.connect(f"file:{self.db_file}?mode=ro", uri=True)
+        try:
+            cols = [r[1] for r in con.execute(f"PRAGMA table_info({self.table})")]
+            expr = "sequence_length" if "sequence_length" in cols else "length(sequence)"
+            logger.info("Building length index for %s.%s via %s (one-time scan) ...",
+                        self.table, os.path.basename(self.db_file), expr)
+            arr = np.fromiter((r[0] for r in con.execute(
+                f"SELECT {expr} FROM {self.table}")), dtype=np.int64, count=self.n)
+        finally:
+            con.close()
+        try:
+            np.save(cache, arr)
+        except Exception:  # noqa: BLE001
+            pass
+        return arr
 
     def _connection(self):
         pid = os.getpid()
@@ -386,7 +418,8 @@ class SqliteCropDataset(_CropDatasetBase):
 def get_dynamic_datasets(args, tokenizer):
     crop = args.max_length
     if args.training_data == "all":
-        train_ds = SqliteCropDataset(args.uniref_db, args.train_table, tokenizer, crop)
+        train_ds = SqliteCropDataset(args.uniref_db, args.train_table, tokenizer, crop,
+                                     with_lengths=args.group_by_length)
         eval_ds = SqliteCropDataset(args.uniref_db, args.val_table, tokenizer, crop)
         logger.info("UniRef50 (lazy): train=%d val=%d", len(train_ds), len(eval_ds))
         return train_ds, eval_ds
@@ -807,13 +840,43 @@ def stage_param_groups(model, lr_map):
     return groups, n
 
 
-def make_trainer_class():
+# ============================================================================= #
+#  LENGTH-GROUPED SAMPLER
+#  Batches similar-length sequences together to cut padding waste -- driven by
+#  the dataset's *known* residue lengths (dataset.lengths), so no tokenization
+#  pass is needed (works for the lazy UniRef50 dataset too). This replaces HF's
+#  group_by_length, whose default path would tokenize the whole corpus to derive
+#  lengths. Dynamic random cropping is preserved; we only reorder the indices.
+# ============================================================================= #
+def build_length_grouped_sampler(trainer, enabled):
+    lengths = getattr(trainer.train_dataset, "lengths", None)
+    if not enabled or lengths is None:
+        return None
+    try:
+        from transformers.trainer_pt_utils import (
+            LengthGroupedSampler, DistributedLengthGroupedSampler)
+    except Exception:  # noqa: BLE001
+        logger.warning("LengthGroupedSampler unavailable; using the default sampler.")
+        return None
+    mega = trainer.args.train_batch_size * trainer.args.gradient_accumulation_steps
+    world = getattr(trainer.args, "world_size", 1) or 1
+    if world <= 1:
+        return LengthGroupedSampler(mega, lengths=lengths)
+    return DistributedLengthGroupedSampler(
+        mega, num_replicas=world, rank=trainer.args.process_index, lengths=lengths)
+
+
+def make_trainer_class(group_by_length=False):
     from transformers import Trainer
 
     class _Trainer(Trainer):
         puma_lambda = 0.0
         reg_child = None
         reg_parent = None
+
+        def _get_train_sampler(self, *a, **k):
+            s = build_length_grouped_sampler(self, group_by_length)
+            return s if s is not None else super()._get_train_sampler(*a, **k)
 
         def compute_loss(self, model, inputs, return_outputs=False, **kw):
             outputs = model(**inputs)
@@ -988,7 +1051,7 @@ def run_stage(args, name, stage_idx, model, tokenizer, train_ds, eval_ds, collat
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_grad_norm=args.max_grad_norm, fp16=fp16, bf16=bf16,
         gradient_checkpointing=args.gradient_checkpointing,
-        group_by_length=args.group_by_length, torch_compile=args.torch_compile,
+        torch_compile=args.torch_compile,
         dataloader_num_workers=args.dataloader_num_workers,
         do_eval=do_eval, eval_strategy="steps" if do_eval else "no",
         eval_steps=args.eval_steps, logging_steps=args.logging_steps,
@@ -1001,7 +1064,9 @@ def run_stage(args, name, stage_idx, model, tokenizer, train_ds, eval_ds, collat
     if wandb_active:
         callbacks.append(make_wandb_stage_callback(step_offset, stage_idx))
 
-    TrainerCls = make_trainer_class()
+    # length grouping is handled by our custom sampler (driven by known lengths),
+    # not by TrainingArguments.group_by_length.
+    TrainerCls = make_trainer_class(args.group_by_length)
     kwargs = dict(model=model, args=ta, train_dataset=train_ds, eval_dataset=eval_ds,
                   data_collator=collator, optimizers=(optimizer, scheduler),
                   callbacks=callbacks)
@@ -1222,7 +1287,9 @@ def parse_args():
                         "adamw_torch. The staged trainer builds AdamW directly.")
     p.add_argument("--precision", default="auto", choices=["auto", "bf16", "fp16", "no"])
     p.add_argument("--gradient_checkpointing", action="store_true")
-    p.add_argument("--group_by_length", action="store_true", default=True)
+    p.add_argument("--group_by_length", action="store_true", default=True,
+                   help="Length-grouped batching via known residue lengths "
+                        "(cuts padding waste; no tokenization pass).")
     p.add_argument("--no_group_by_length", dest="group_by_length", action="store_false")
     p.add_argument("--torch_compile", action="store_true")
     p.add_argument("--dataloader_num_workers", type=int, default=4)
@@ -1272,10 +1339,9 @@ def main():
 
     if args.training_data == "fasta" and not args.fasta:
         raise ValueError("--training_data fasta requires --fasta PATH")
-    # dynamic random cropping makes precomputed lengths meaningless -> no grouping.
     if args.group_by_length:
-        logger.info("Disabling group_by_length (incompatible with dynamic cropping).")
-        args.group_by_length = False
+        logger.info("Length-grouped batching ON (known residue lengths; dynamic "
+                    "cropping preserved).")
 
     slug = build_run_slug(args)
     if not args.output_dir:
