@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import Trainer, TrainingArguments, set_seed
 
-from plm_benchmark.config import LR_FULL_FT, LR_LORA, OUTPUTS_DIR
+from plm_benchmark.config import CHECKPOINT_POLICY, LR_FULL_FT, LR_LORA, OUTPUTS_DIR
 from plm_benchmark.models.esm import load_classifier, set_gpu, tokenize_dataset
 from plm_benchmark.results import append_experiment
 from plm_benchmark.tasks import TaskSpec, preprocess_sequences
@@ -35,6 +35,8 @@ def _metrics_fn(spec: TaskSpec):
             preds = np.argmax(preds, axis=1)
         else:
             m = load("spearmanr")
+            preds = np.squeeze(preds).astype(float)
+            labels = np.asarray(labels, dtype=float)
         return m.compute(predictions=preds, references=labels)
 
     return compute
@@ -90,44 +92,65 @@ def run_finetune(
     valid_df = preprocess_sequences(valid_df)
     test_df = preprocess_sequences(test_df)
 
-    run_dir = OUTPUTS_DIR / spec.name.lower()
+    run_dir = OUTPUTS_DIR / model_name / spec.name.lower() / method / f"seed_{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n=== {spec.name} | {method} | {checkpoint} ===", flush=True)
-    print(f"Train/valid: {len(train_df)}/{len(valid_df)} | epochs={epochs} lr={lr}", flush=True)
+    metric_for_best = f"eval_{spec.metric}"
+
+    print(f"\n=== {spec.name} | {method} | seed={seed} | {checkpoint} ===", flush=True)
+    print(
+        f"Train/valid: {len(train_df)}/{len(valid_df)} | epochs={epochs} lr={lr} "
+        f"| checkpoint={CHECKPOINT_POLICY}",
+        flush=True,
+    )
 
     model, tokenizer = load_classifier(checkpoint, spec.num_labels, method=method)
     train_ds = tokenize_dataset(tokenizer, list(train_df["sequence"]), list(train_df["label"]))
     valid_ds = tokenize_dataset(tokenizer, list(valid_df["sequence"]), list(valid_df["label"]))
 
-    trainer = Trainer(
-        model,
-        TrainingArguments(
-            str(run_dir / "hf_cache"),
-            evaluation_strategy="epoch",
-            logging_strategy="epoch",
-            save_strategy="no",
-            learning_rate=lr,
-            per_device_train_batch_size=batch,
-            per_device_eval_batch_size=val_batch,
-            gradient_accumulation_steps=accum,
-            num_train_epochs=epochs,
-            seed=seed,
-            fp16=fp16,
-            report_to="none",
-        ),
+    import inspect
+
+    ta_kwargs = dict(
+        output_dir=str(run_dir / "hf_cache"),
+        eval_strategy="epoch",
+        logging_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model=metric_for_best,
+        greater_is_better=True,
+        save_total_limit=1,
+        learning_rate=lr,
+        per_device_train_batch_size=batch,
+        per_device_eval_batch_size=val_batch,
+        gradient_accumulation_steps=accum,
+        num_train_epochs=epochs,
+        seed=seed,
+        fp16=fp16,
+        report_to="none",
+    )
+    if "evaluation_strategy" in inspect.signature(TrainingArguments.__init__).parameters:
+        ta_kwargs["evaluation_strategy"] = ta_kwargs.pop("eval_strategy")
+
+    trainer_kwargs = dict(
+        model=model,
+        args=TrainingArguments(**ta_kwargs),
         train_dataset=train_ds,
         eval_dataset=valid_ds,
-        tokenizer=tokenizer,
         compute_metrics=_metrics_fn(spec),
     )
+    if "processing_class" in inspect.signature(Trainer.__init__).parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        trainer_kwargs["tokenizer"] = tokenizer
+
+    trainer = Trainer(**trainer_kwargs)
     trainer.train()
 
     weights = run_dir / "finetuned_weights.pth"
     torch.save({n: p for n, p in model.named_parameters() if p.requires_grad}, weights)
 
     test = _test_score(model, tokenizer, test_df, spec)
-    key = f"eval_{spec.metric}"
+    key = metric_for_best
     val = max((x[key] for x in trainer.state.log_history if key in x), default=None)
 
     print(f"Test {spec.metric}: {test:.4f} | best val: {val}", flush=True)
@@ -145,7 +168,8 @@ def run_finetune(
         "lr": lr,
         "batch": batch,
         "seed": seed,
-        "run_dir": str(run_dir),
+        "checkpoint_policy": CHECKPOINT_POLICY,
+        "run_dir": str(run_dir.relative_to(OUTPUTS_DIR.parent)),
     }
     append_experiment(row)
 

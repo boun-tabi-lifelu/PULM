@@ -10,7 +10,7 @@ import pandas as pd
 import scipy.stats
 from sklearn.metrics import accuracy_score
 
-from plm_benchmark.config import CACHE_DIR, EMBED_CACHE_SUFFIX, LR_EMBED_HEAD
+from plm_benchmark.config import CACHE_DIR, EMBED_CACHE_SUFFIX, LR_EMBED_HEAD, OUTPUTS_DIR
 from plm_benchmark.models.esm import mean_pool_embeddings
 from plm_benchmark.results import append_experiment
 from plm_benchmark.tasks import TaskSpec, preprocess_sequences
@@ -147,7 +147,7 @@ def run_embed_head(
         "lr": LR_EMBED_HEAD,
         "batch": batch,
         "seed": seed,
-        "run_dir": str(cache_dir),
+        "run_dir": str(cache_dir.relative_to(OUTPUTS_DIR.parent)),
     }
     append_experiment(row)
     return row
