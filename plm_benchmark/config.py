@@ -9,6 +9,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "training data"
+
+
+def _default_peta_data_dir() -> Path:
+    candidates = [
+        ROOT / "training data" / "PETA" / "ft_datasets",
+        ROOT / "ft_datasets",
+    ]
+    for path in candidates:
+        if path.is_dir():
+            return path
+    return candidates[-1]
+
+
+PETA_DATA_DIR = Path(os.environ.get("PETA_DATA_DIR", str(_default_peta_data_dir())))
 OUTPUTS_DIR = ROOT / "outputs"
 CACHE_DIR = OUTPUTS_DIR / "embeddings"
 LOG_CSV = OUTPUTS_DIR / "experiments.csv"

@@ -34,11 +34,14 @@ def load_classifier(
     *,
     method: str = "full_ft",
     lora_r: int = 4,
+    problem_type: str | None = None,
 ) -> tuple[AutoModelForSequenceClassification, AutoTokenizer]:
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
     model = AutoModelForSequenceClassification.from_pretrained(
         checkpoint, num_labels=num_labels, ignore_mismatched_sizes=True
     )
+    if problem_type:
+        model.config.problem_type = problem_type
 
     if method == "lora":
         config = LoraConfig(
