@@ -1,5 +1,4 @@
-"""Load PETA benchmark splits (JSON) with the same preprocessing as ProteinPretraining.
-
+"""
 Data: download benchmark_datasets.zip from the PETA repo and unzip to ft_datasets/
 https://github.com/mingchen-li/ProteinPretraining
 """

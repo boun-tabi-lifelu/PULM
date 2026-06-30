@@ -1,4 +1,3 @@
-"""PETA benchmark task definitions (Tan et al. / ProteinPretraining)."""
 
 from __future__ import annotations
 

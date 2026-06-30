@@ -37,7 +37,7 @@ def _set_seeds(seed: int) -> None:
 
 
 def _score_predictions(preds: np.ndarray, labels: np.ndarray, spec: TaskSpec) -> float:
-    if spec.task_type == "classification":
+    if spec.task_type in ("classification", "ppi"):
         return float(accuracy_score(labels, np.argmax(preds, axis=1)))
     if spec.task_type == "multilabel":
         probs = 1 / (1 + np.exp(-preds))
