@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 from transformers.modeling_outputs import SequenceClassifierOutput
 
 from plm_benchmark.models.peta_heads import (
@@ -54,7 +54,11 @@ def load_peta_model(
     train_encoder: bool = True,
 ) -> tuple[EsmPetaClassifier, AutoTokenizer]:
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-    encoder = AutoModel.from_pretrained(checkpoint, add_pooling_layer=False)
+    model_type = AutoConfig.from_pretrained(checkpoint).model_type
+    enc_kwargs: dict = {}
+    if model_type == "esm":
+        enc_kwargs["add_pooling_layer"] = False
+    encoder = AutoModel.from_pretrained(checkpoint, **enc_kwargs)
 
     if not train_encoder:
         for param in encoder.parameters():
