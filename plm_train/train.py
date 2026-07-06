@@ -190,6 +190,8 @@ def build_run_slug(args) -> str:
         tok = f"BPE_{args.vocab_size}"
     else:  # aa
         tok = "AA"
+    if getattr(args, "puma_collapse_to_parent", False):
+        tok += "_PC"    # parent-collapsed vocab
     return f"ESM2_{size}_{tok}_{args.training_data}"
 
 
@@ -298,6 +300,69 @@ def _attach_template(backend, specials: Dict[str, str]):
 
 
 # ============================================================================= #
+#  PUMA CHILD->PARENT COLLAPSE  (optional, reduces the model vocab)
+# ============================================================================= #
+def load_genealogy(args):
+    """{child_str: {'is_child', 'parent'}} from the PUMA attributes JSON (the
+    non-'hf_' sibling of the tokenizer file). {} for bpe/aa or if absent."""
+    import json
+    if args.tokenizer_type.lower() != "puma":
+        return {}
+    hf_path = resolve_tokenizer_path(args)
+    d, base = os.path.split(hf_path)
+    attr = os.path.join(d, base[3:]) if base.startswith("hf_") else None
+    if not attr or not os.path.isfile(attr):
+        logger.warning("PUMA attributes file not found (%s); cannot collapse.", attr)
+        return {}
+    with open(attr) as fh:
+        raw = json.load(fh)
+    return {t: {"is_child": True, "parent": m["parent"]}
+            for t, m in raw.items() if "parent" in m}
+
+
+def build_puma_collapse(full_tokenizer, genealogy, specials, max_length):
+    """Fold every PUMA child onto its family parent. Returns (reduced_tokenizer,
+    collapse) where collapse[old_id]=new_id; the model vocab keeps only parents +
+    singletons (+ specials). Sequences are tokenized with the FULL vocab and then
+    remapped, so segmentation is unchanged. PUMA children are length-preserving,
+    so residue spans are unaffected."""
+    from tokenizers import Tokenizer, models, pre_tokenizers, Regex
+    from transformers import PreTrainedTokenizerFast
+
+    full_vocab = full_tokenizer.get_vocab()
+    id2str = {i: s for s, i in full_vocab.items()}
+    reduced, old2new = {}, {}
+    for old_id in sorted(id2str):
+        s = id2str[old_id]
+        meta = genealogy.get(s)
+        if meta and meta.get("is_child"):
+            continue
+        old2new[old_id] = len(reduced)
+        reduced[s] = old2new[old_id]
+
+    unk_new = reduced.get(specials["unk_token"], 0)
+    collapse = np.empty(len(full_vocab), dtype=np.int64)
+    n_child = 0
+    for old_id, s in id2str.items():
+        meta = genealogy.get(s)
+        if meta and meta.get("is_child"):
+            pid = full_vocab.get(meta["parent"])
+            collapse[old_id] = old2new.get(pid, unk_new)
+            n_child += 1
+        else:
+            collapse[old_id] = old2new[old_id]
+
+    backend = Tokenizer(models.WordLevel(vocab=reduced, unk_token=specials["unk_token"]))
+    backend.pre_tokenizer = pre_tokenizers.Split(pattern=Regex(""), behavior="isolated")
+    _attach_template(backend, specials)
+    red_tok = PreTrainedTokenizerFast(tokenizer_object=backend,
+                                      model_max_length=max_length, **specials)
+    logger.info("PUMA collapse-to-parent: %d children folded into parents; "
+                "vocab %d -> %d", n_child, len(full_vocab), len(reduced))
+    return red_tok, collapse
+
+
+# ============================================================================= #
 #  FASTA -> tokenized HuggingFace Dataset
 # ============================================================================= #
 def iter_fasta(path: str, min_length: int, max_samples: Optional[int]) -> Iterator[Dict[str, str]]:
@@ -373,17 +438,20 @@ def load_human_sequences(args) -> List[str]:
 #  the crop is random per access, length-grouping is disabled by the caller.
 # ============================================================================= #
 class _CropDatasetBase:
-    def __init__(self, tokenizer, crop_length: int):
-        self.tokenizer = tokenizer
+    def __init__(self, tokenizer, crop_length: int, collapse=None, bos=None, eos=None):
+        self.tokenizer = tokenizer                 # tokenizes raw sequences (full vocab)
         self.W = int(crop_length)
-        self.bos = tokenizer.cls_token_id          # ESM2 BOS == <cls>
-        self.eos = tokenizer.eos_token_id
+        self.collapse = collapse                   # optional old_id -> new_id remap
+        self.bos = bos if bos is not None else tokenizer.cls_token_id   # ESM2 BOS == <cls>
+        self.eos = eos if eos is not None else tokenizer.eos_token_id
         if self.bos is None or self.eos is None:
             raise ValueError("Tokenizer must define cls/eos tokens for BOS/EOS.")
 
     def encode(self, seq: str) -> Dict[str, List[int]]:
         core = self.tokenizer(seq, add_special_tokens=False,
                               truncation=False)["input_ids"]
+        if self.collapse is not None:              # PUMA children -> family parents
+            core = self.collapse[np.asarray(core, dtype=np.int64)].tolist()
         L = len(core)
         if L <= self.W:                            # full protein -> BOS..EOS
             ids = [self.bos] + core + [self.eos]
@@ -399,9 +467,13 @@ class _CropDatasetBase:
 
 class InMemoryCropDataset(_CropDatasetBase):
     """For small corpora (e.g. the 67k human set) held in memory."""
-    def __init__(self, sequences: List[str], tokenizer, crop_length: int):
-        super().__init__(tokenizer, crop_length)
+    def __init__(self, sequences: List[str], tokenizer, crop_length: int,
+                 collapse=None, bos=None, eos=None):
+        super().__init__(tokenizer, crop_length, collapse, bos, eos)
         self.sequences = sequences
+        # residue length per example -> free, monotonic proxy for token length;
+        # used by the length-grouped sampler (no tokenization needed).
+        self.lengths = [len(s) for s in sequences]
 
     def __len__(self):
         return len(self.sequences)
@@ -414,8 +486,9 @@ class SqliteCropDataset(_CropDatasetBase):
     """Lazy reader over a split table (entry_id, sequence) for full UniRef50:
     sequences are fetched by rowid on demand, so the corpus never lives in RAM.
     A read-only sqlite connection is (re)opened per worker process."""
-    def __init__(self, db_file: str, table: str, tokenizer, crop_length: int):
-        super().__init__(tokenizer, crop_length)
+    def __init__(self, db_file: str, table: str, tokenizer, crop_length: int,
+                 with_lengths: bool = False, collapse=None, bos=None, eos=None):
+        super().__init__(tokenizer, crop_length, collapse, bos, eos)
         self.db_file, self.table = db_file, table
         con = sqlite3.connect(db_file)
         try:
@@ -434,6 +507,35 @@ class SqliteCropDataset(_CropDatasetBase):
             con.close()
         self._conn = None
         self._pid = None
+        self.lengths = self._load_lengths() if with_lengths else None
+
+    def _load_lengths(self):
+        """Per-row residue length in rowid order (aligned with __getitem__), via a
+        stored sequence_length column when present, else SQL length(sequence).
+        Cached to a .npy next to the DB so it is a one-time scan."""
+        cache = f"{self.db_file}.{self.table}.lengths.npy"
+        if os.path.isfile(cache):
+            try:
+                arr = np.load(cache)
+                if len(arr) == self.n:
+                    return arr
+            except Exception:  # noqa: BLE001
+                pass
+        con = sqlite3.connect(f"file:{self.db_file}?mode=ro", uri=True)
+        try:
+            cols = [r[1] for r in con.execute(f"PRAGMA table_info({self.table})")]
+            expr = "sequence_length" if "sequence_length" in cols else "length(sequence)"
+            logger.info("Building length index for %s.%s via %s (one-time scan) ...",
+                        self.table, os.path.basename(self.db_file), expr)
+            arr = np.fromiter((r[0] for r in con.execute(
+                f"SELECT {expr} FROM {self.table}")), dtype=np.int64, count=self.n)
+        finally:
+            con.close()
+        try:
+            np.save(cache, arr)
+        except Exception:  # noqa: BLE001
+            pass
+        return arr
 
     def _connection(self):
         pid = os.getpid()
@@ -453,17 +555,24 @@ class SqliteCropDataset(_CropDatasetBase):
         return self.encode(row[0])
 
 
-def get_dynamic_datasets(args, tokenizer):
+def get_dynamic_datasets(args, tokenizer, data_tokenizer=None, collapse=None):
     """Build (train_ds, eval_ds) torch datasets with dynamic cropping, selected
     by --training_data: 'all' -> UniRef50 split tables (lazy); 'human'/'fasta'
-    -> in-memory corpus with a random --val_split holdout."""
+    -> in-memory corpus with a random --val_split holdout.
+    `tokenizer` defines the model id space (BOS/EOS); `data_tokenizer` does the
+    raw tokenization (the full PUMA vocab when collapsing children to parents)."""
     crop = args.max_length                          # crop window = CORE tokens
+    data_tok = data_tokenizer or tokenizer
+    bos, eos = tokenizer.cls_token_id, tokenizer.eos_token_id
 
     if args.training_data == "all":
         logger.info("training_data=all -> UniRef50 split tables %s/%s in %s",
                     args.train_table, args.val_table, args.uniref_db)
-        train_ds = SqliteCropDataset(args.uniref_db, args.train_table, tokenizer, crop)
-        eval_ds = SqliteCropDataset(args.uniref_db, args.val_table, tokenizer, crop)
+        train_ds = SqliteCropDataset(args.uniref_db, args.train_table, data_tok, crop,
+                                     with_lengths=args.group_by_length,
+                                     collapse=collapse, bos=bos, eos=eos)
+        eval_ds = SqliteCropDataset(args.uniref_db, args.val_table, data_tok, crop,
+                                    collapse=collapse, bos=bos, eos=eos)
         logger.info("Lazy UniRef50: train=%d val=%d sequences", len(train_ds), len(eval_ds))
         return train_ds, eval_ds
 
@@ -489,8 +598,9 @@ def get_dynamic_datasets(args, tokenizer):
     else:
         train_seqs, val_seqs = seqs, []
 
-    train_ds = InMemoryCropDataset(train_seqs, tokenizer, crop)
-    eval_ds = InMemoryCropDataset(val_seqs, tokenizer, crop) if val_seqs else None
+    train_ds = InMemoryCropDataset(train_seqs, data_tok, crop, collapse, bos, eos)
+    eval_ds = (InMemoryCropDataset(val_seqs, data_tok, crop, collapse, bos, eos)
+               if val_seqs else None)
     logger.info("In-memory split (%s) -> train=%d val=%d",
                 args.training_data, len(train_seqs), len(val_seqs))
     return train_ds, eval_ds
@@ -720,6 +830,10 @@ def parse_args():
                    help="Tokenizer vocab size in the filename "
                         "(800/1600/3200/6400/12800/25600/51200). NOT the model vocab, "
                         "which is derived from the loaded tokenizer.")
+    p.add_argument("--puma_collapse_to_parent", action="store_true",
+                   help="PUMA only: fold every mutational child onto its family "
+                        "parent. Sequences are tokenized with the full vocab then "
+                        "remapped; the model vocab shrinks to parents+singletons.")
 
     # model
     p.add_argument("--model_size", default="8M",
@@ -764,7 +878,9 @@ def parse_args():
     # hardware / efficiency
     p.add_argument("--precision", default="auto", choices=["auto", "bf16", "fp16", "no"])
     p.add_argument("--gradient_checkpointing", action="store_true")
-    p.add_argument("--group_by_length", action="store_true", default=True)
+    p.add_argument("--group_by_length", action="store_true", default=True,
+                   help="Length-grouped batching via known residue lengths "
+                        "(cuts padding waste; no tokenization pass).")
     p.add_argument("--no_group_by_length", dest="group_by_length", action="store_false")
     p.add_argument("--dataloader_num_workers", type=int, default=4)
     p.add_argument("--torch_compile", action="store_true")
@@ -774,8 +890,8 @@ def parse_args():
                    help="Defaults to the auto run name, e.g. ESM2_8M_PUMA_blosum62_07_005_51200.")
     p.add_argument("--logging_steps", type=int, default=5000)
     p.add_argument("--eval_steps", type=int, default=25000)
-    p.add_argument("--save_steps", type=int, default=25000)
-    p.add_argument("--save_total_limit", type=int, default=3)
+    p.add_argument("--save_steps", type=int, default=100000)
+    p.add_argument("--save_total_limit", type=int, default=6)
     p.add_argument("--resume_from_checkpoint", default=None,
                    help="Checkpoint dir to resume from, or 'true'/'latest' to pick "
                         "the newest checkpoint in --output_dir.")
@@ -825,7 +941,7 @@ DEFAULT_PROBES = [
 ]
 
 
-def sanity_check(model_dir, sequences, topk, max_length):
+def sanity_check(model_dir, sequences, topk, max_length, data_tok=None, collapse=None):
     import torch
     from transformers import AutoModelForMaskedLM, AutoTokenizer
 
@@ -838,14 +954,22 @@ def sanity_check(model_dir, sequences, topk, max_length):
         logger.error("Tokenizer has no mask token - cannot run MLM check.")
         return
 
+    def encode(seq):                                # tokenize-then-collapse when on
+        if collapse is None:
+            return tok(seq, return_tensors="pt", truncation=True,
+                       max_length=max_length)["input_ids"][0]
+        core = data_tok(seq, add_special_tokens=False, truncation=True,
+                        max_length=max_length - 2)["input_ids"]
+        core = collapse[np.asarray(core, dtype=np.int64)].tolist()
+        return torch.tensor([tok.cls_token_id] + core + [tok.eos_token_id])
+
     special_ids = set(tok.all_special_ids)
     print("\n" + "=" * 70)
     print("POST-TRAINING SANITY CHECK  (masked-residue prediction)")
     print("=" * 70)
 
     for seq in sequences:
-        enc = tok(seq, return_tensors="pt", truncation=True, max_length=max_length)
-        ids = enc["input_ids"][0]
+        ids = encode(seq)
         positions = [i for i, t in enumerate(ids.tolist()) if t not in special_ids]
         if not positions:
             print(f"  (skipped, no maskable tokens) {seq[:30]}...")
@@ -904,6 +1028,43 @@ def make_resume_step_override_callback():
 
 
 # ============================================================================= #
+#  LENGTH-GROUPED SAMPLER
+#  Batches similar-length sequences together to cut padding waste, driven by the
+#  dataset's *known* residue lengths (dataset.lengths) -- so no tokenization pass
+#  is needed (works for the lazy UniRef50 dataset). Replaces HF's group_by_length,
+#  whose default path would tokenize the whole corpus to derive lengths. Dynamic
+#  random cropping is preserved; only the index order changes.
+# ============================================================================= #
+def build_length_grouped_sampler(trainer, enabled):
+    lengths = getattr(trainer.train_dataset, "lengths", None)
+    if not enabled or lengths is None:
+        return None
+    try:
+        from transformers.trainer_pt_utils import (
+            LengthGroupedSampler, DistributedLengthGroupedSampler)
+    except Exception:  # noqa: BLE001
+        logger.warning("LengthGroupedSampler unavailable; using the default sampler.")
+        return None
+    mega = trainer.args.train_batch_size * trainer.args.gradient_accumulation_steps
+    world = getattr(trainer.args, "world_size", 1) or 1
+    if world <= 1:
+        return LengthGroupedSampler(mega, lengths=lengths)
+    return DistributedLengthGroupedSampler(
+        mega, num_replicas=world, rank=trainer.args.process_index, lengths=lengths)
+
+
+def make_trainer_class(group_by_length):
+    from transformers import Trainer
+
+    class LengthGroupedTrainer(Trainer):
+        def _get_train_sampler(self, *a, **k):
+            s = build_length_grouped_sampler(self, group_by_length)
+            return s if s is not None else super()._get_train_sampler(*a, **k)
+
+    return LengthGroupedTrainer
+
+
+# ============================================================================= #
 #  MAIN
 # ============================================================================= #
 def main():
@@ -919,11 +1080,9 @@ def main():
                     args.training_data, args.data_source)
     if args.training_data == "fasta" and not args.fasta:
         raise ValueError("--training_data fasta requires --fasta PATH")
-    # dynamic random cropping makes precomputed lengths meaningless and a lazy
-    # full pass over UniRef50 untenable -> disable length grouping.
     if args.group_by_length:
-        logger.info("Disabling group_by_length (incompatible with dynamic cropping).")
-        args.group_by_length = False
+        logger.info("Length-grouped batching ON (known residue lengths; dynamic "
+                    "cropping preserved).")
 
     # normalise --resume_from_checkpoint: accept 'true'/'latest'/'auto' -> True
     if isinstance(args.resume_from_checkpoint, str) and \
@@ -960,8 +1119,20 @@ def main():
         report_to, run_name = ["none"], None
 
     # --- build the three pieces -------------------------------------------- #
-    tokenizer = build_tokenizer(args)
-    train_ds, eval_ds = get_dynamic_datasets(args, tokenizer)
+    full_tokenizer = build_tokenizer(args)
+
+    # optional PUMA child->parent collapse: reduced model vocab, full vocab for data
+    tokenizer, data_tokenizer, collapse = full_tokenizer, full_tokenizer, None
+    if args.puma_collapse_to_parent:
+        genealogy = load_genealogy(args)
+        if args.tokenizer_type.lower() != "puma" or not genealogy:
+            raise ValueError("--puma_collapse_to_parent requires a PUMA tokenizer "
+                             "with its attributes (genealogy) file.")
+        specials = get_special_tokens(args.offline)
+        tokenizer, collapse = build_puma_collapse(
+            full_tokenizer, genealogy, specials, args.max_length)
+
+    train_ds, eval_ds = get_dynamic_datasets(args, tokenizer, data_tokenizer, collapse)
     model = build_model(args, tokenizer)
     if args.gradient_checkpointing:
         model.config.use_cache = False
@@ -986,7 +1157,6 @@ def main():
         warmup_steps=warmup_steps,
         lr_scheduler_type=args.lr_scheduler_type, optim=args.optim,
         fp16=fp16, bf16=bf16, gradient_checkpointing=args.gradient_checkpointing,
-        group_by_length=args.group_by_length, length_column_name="length",
         dataloader_num_workers=args.dataloader_num_workers,
         torch_compile=args.torch_compile,
         do_eval=do_eval, eval_strategy="steps" if do_eval else "no",
@@ -1008,7 +1178,8 @@ def main():
         trainer_kwargs["processing_class"] = tokenizer
     else:
         trainer_kwargs["tokenizer"] = tokenizer
-    trainer = Trainer(**trainer_kwargs)
+    # length grouping handled by our sampler (known lengths), not TrainingArguments.
+    trainer = make_trainer_class(args.group_by_length)(**trainer_kwargs)
 
     logger.info("Starting training ...")
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
@@ -1016,6 +1187,12 @@ def main():
     final_dir = os.path.join(args.output_dir, "final")
     trainer.save_model(final_dir)
     tokenizer.save_pretrained(final_dir)
+    # With collapse the saved (reduced) tokenizer cannot tokenize raw sequences;
+    # persist the full PUMA tokenizer + collapse map for tokenize-then-collapse.
+    if collapse is not None:
+        full_tokenizer.save_pretrained(os.path.join(final_dir, "full_tokenizer"))
+        np.save(os.path.join(final_dir, "collapse.npy"), collapse)
+        logger.info("Saved full_tokenizer/ + collapse.npy for parent-collapsed inference.")
     logger.info("Saved final model + tokenizer to %s", final_dir)
 
     if do_eval:
@@ -1032,7 +1209,8 @@ def main():
         probes = ([s.strip() for s in args.sanity_sequences.split(",") if s.strip()]
                   if args.sanity_sequences else DEFAULT_PROBES)
         try:
-            sanity_check(final_dir, probes, args.sanity_topk, args.max_length)
+            sanity_check(final_dir, probes, args.sanity_topk, args.max_length,
+                         data_tokenizer, collapse)
         except Exception as e:  # noqa: BLE001
             logger.warning("Sanity check failed (training still succeeded): %s", e)
 
