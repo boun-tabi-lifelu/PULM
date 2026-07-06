@@ -26,6 +26,11 @@ class TaskSpec:
     data_source: str = "rost"  # rost | peta
     peta_key: str | None = None
     default_split: str | None = None
+    # Recipe (per task). Rost defaults below; PETA overrides in peta_tasks.py.
+    lr: float | None = None  # None -> method default (see methods/train.py)
+    weight_decay: float = 0.0
+    patience: int = 0  # 0 disables early stopping
+    head_type: str = "attention1d"
 
 
 TASKS: dict[str, TaskSpec] = {

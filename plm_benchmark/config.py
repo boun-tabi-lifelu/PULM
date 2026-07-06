@@ -89,6 +89,12 @@ def get_models() -> dict[str, ModelConfig]:
 
 def resolve_model(name: str | None = None, checkpoint: str | None = None) -> ModelConfig:
     models = get_models()
+
+    # scratch_<model>: randomly-initialised baseline that borrows <model>'s tokenizer.
+    if name and name.startswith("scratch_"):
+        base = resolve_model(name[len("scratch_") :], checkpoint)
+        return ModelConfig(name=name, checkpoint=base.checkpoint, backend="scratch", source="scratch")
+
     if checkpoint:
         ckpt = str(Path(checkpoint).resolve())
         if name and name in models:

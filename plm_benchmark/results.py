@@ -16,6 +16,7 @@ EXPERIMENT_FIELDS = [
     "model",
     "checkpoint",
     "method",
+    "split",
     "metric",
     "test_score",
     "val_score",
@@ -50,9 +51,7 @@ def load_experiments(path: Path = LOG_CSV, *, keep_all: bool = False) -> pd.Data
     df = df[ok]
     if keep_all:
         return df.sort_values("timestamp")
-    subset = ["task", "model", "method", "seed"]
-    if "seed" not in df.columns:
-        subset = ["task", "model", "method"]
+    subset = [c for c in ["task", "model", "method", "split", "seed"] if c in df.columns]
     return df.sort_values("timestamp").drop_duplicates(subset=subset, keep="last")
 
 
@@ -70,16 +69,16 @@ def build_comparison(log_path: Path = LOG_CSV, out_path: Path = COMPARE_CSV) -> 
     df["test_score"] = pd.to_numeric(df["test_score"], errors="coerce")
     df["val_score"] = pd.to_numeric(df["val_score"], errors="coerce")
 
+    group_cols = [c for c in ["task", "model", "method", "split"] if c in df.columns]
     rows = []
-    for (task, model, method), sub in df.groupby(["task", "model", "method"], sort=True):
+    for keys, sub in df.groupby(group_cols, sort=True):
+        record = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
         metric = sub["metric"].iloc[0]
         scores = sub["test_score"].dropna()
         vals = sub["val_score"].dropna()
         rows.append(
             {
-                "task": task,
-                "model": model,
-                "method": method,
+                **record,
                 "metric": metric,
                 "n_seeds": len(scores),
                 "test_mean": round(scores.mean(), 6) if len(scores) else "",

@@ -1,7 +1,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from plm_benchmark.tasks import TaskSpec
+
+# PETA protocol (peta/train.py defaults): lr=1e-3, wd=0.001, max_epochs=100, patience=20.
+PETA_LR = 1e-3
+PETA_WEIGHT_DECAY = 0.001
+PETA_PATIENCE = 20
 
 # Task names use prefix peta_ to distinguish from Rost tasks (GB1, AAV, ...).
 # Use --split-method for datasets with multiple splits (gb1, aav, meltome, ...).
@@ -101,4 +108,10 @@ PETA_TASKS: dict[str, TaskSpec] = {
         "peta_ppi_sun", "", "", "", "ppi", 2, 100, 100, "accuracy",
         data_source="peta", peta_key="ppi_sun",
     ),
+}
+
+# Apply the shared PETA training recipe to every PETA task.
+PETA_TASKS = {
+    name: replace(spec, lr=PETA_LR, weight_decay=PETA_WEIGHT_DECAY, patience=PETA_PATIENCE)
+    for name, spec in PETA_TASKS.items()
 }
