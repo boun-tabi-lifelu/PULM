@@ -1,4 +1,4 @@
-"""ESM-2 model loading and embedding."""
+"""ESM / PULM model loading and embedding."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig, inject_adapter_in_model
 from tqdm import tqdm
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, EsmModel
+from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 
 from plm_benchmark.config import MAX_SEQ_LENGTH
 
@@ -19,9 +19,9 @@ def set_gpu(gpu_index: int) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index - 1)
 
 
-def load_encoder(checkpoint: str, device: torch.device | None = None) -> tuple[EsmModel, AutoTokenizer]:
+def load_encoder(checkpoint: str, device: torch.device | None = None) -> tuple[AutoModel, AutoTokenizer]:
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-    model = EsmModel.from_pretrained(checkpoint)
+    model = AutoModel.from_pretrained(checkpoint)
     if device is not None:
         model = model.to(device)
     model.eval()
@@ -34,9 +34,14 @@ def load_classifier(
     *,
     method: str = "full_ft",
     lora_r: int = 4,
+    problem_type: str | None = None,
 ) -> tuple[AutoModelForSequenceClassification, AutoTokenizer]:
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-    model = AutoModelForSequenceClassification.from_pretrained(checkpoint, num_labels=num_labels)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        checkpoint, num_labels=num_labels, ignore_mismatched_sizes=True
+    )
+    if problem_type:
+        model.config.problem_type = problem_type
 
     if method == "lora":
         config = LoraConfig(

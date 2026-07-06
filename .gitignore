@@ -6,17 +6,30 @@ __pycache__/
 # Environments
 .venv/
 .env
+scripts/checkpoints.env
 
-# Data (unzip training data.zip locally)
+# Data (download from upstream data repo)
 training data/
+ft_datasets/
 
-# Large run artifacts (CSVs in outputs/ are tracked)
-outputs/embeddings/
-outputs/*/finetuned_weights.pth
-outputs/*/hf_cache/
+# Run logs
+logs/*
+!logs/.gitkeep
+
+# Outputs: keep summary CSVs and small archives
+outputs/**
+!outputs/.gitkeep
+!outputs/experiments.csv
+!outputs/comparison.csv
+!outputs/archives/
+outputs/archives/**
+!outputs/archives/*.csv
+!outputs/archives/*.md
 
 # Caches
 .cache/
+outputs/**/hf_cache/
+outputs/**/_probe_cache/
 
 # Backups
 *.bak
