@@ -55,6 +55,7 @@ def cmd_train(args: argparse.Namespace) -> None:
                     fp16=not args.no_fp16,
                     max_length=args.max_length,
                     val_batch=args.val_batch,
+                    eval_every=args.eval_every,
                     patience=args.patience,
                     tokenizer_spec=args.tokenizer,
                     scratch_dim=args.scratch_dim,
@@ -170,10 +171,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Tokenizer for --model scratch (required): 'esm2', a tokenizer.json path, "
         "a saved-tokenizer dir, or a hub id. Optional override for other models.",
     )
-    t.add_argument("--gpu", type=int, default=2, help="GPU id (1 = first device)")
+    t.add_argument("--gpu", type=int, default=1, help="GPU id (1 = first device)")
     t.add_argument("--epochs", type=int, default=None)
-    t.add_argument("--batch", type=int, default=8)
-    t.add_argument("--val-batch", type=int, default=16)
+    t.add_argument("--batch", type=int, default=64)
+    t.add_argument("--val-batch", type=int, default=64)
+    t.add_argument(
+        "--eval-every",
+        type=int,
+        default=1,
+        help="Evaluate + checkpoint every N epochs (1=every epoch). >1 speeds up long runs; "
+        "early-stopping patience then counts eval events, not epochs.",
+    )
     t.add_argument("--accum", type=int, default=1)
     t.add_argument("--lr", type=float, default=None)
     t.add_argument("--seed", type=int, default=None, help="Single seed (overrides --seeds)")

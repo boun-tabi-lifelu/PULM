@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import csv
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+try:
+    import fcntl  # POSIX advisory locking (Linux/macOS)
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
 
 from plm_benchmark.config import CHECKPOINT_POLICY, COMPARE_CSV, LOG_CSV
 
@@ -31,14 +37,25 @@ EXPERIMENT_FIELDS = [
 
 
 def append_experiment(row: dict, path: Path = LOG_CSV) -> None:
+    """Append one row. Safe under concurrent writers via an exclusive file lock,
+    so parallel runs (many processes on one GPU) don't interleave/corrupt rows."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists()
     normalized = {k: row.get(k, "") for k in EXPERIMENT_FIELDS}
     with path.open("a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=EXPERIMENT_FIELDS)
-        if write_header:
-            w.writeheader()
-        w.writerow(normalized)
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.seek(0, os.SEEK_END)
+            write_header = f.tell() == 0  # decided while holding the lock
+            w = csv.DictWriter(f, fieldnames=EXPERIMENT_FIELDS)
+            if write_header:
+                w.writeheader()
+            w.writerow(normalized)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            if fcntl is not None:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def load_experiments(path: Path = LOG_CSV, *, keep_all: bool = False) -> pd.DataFrame:

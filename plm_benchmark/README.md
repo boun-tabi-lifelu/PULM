@@ -116,6 +116,79 @@ root are still detected as a fallback.)
   `python -m plm_benchmark.cli compare`.
 - `outputs/<model>/<task>/<split>/<method>/seed_<n>/` — Trainer cache + `finetuned_weights.pth`.
 
+## Parallel execution on one GPU
+
+Downstream tasks are tiny and use little GPU memory, so a single run leaves most
+of an H100 idle. `(model, task, seed)` jobs are fully independent — run many at
+once to fill the GPU. No SLURM needed; this is designed for a single screen session.
+
+### 1. Profile one representative run first
+
+Decide where the time goes before tuning `--jobs`.
+
+```bash
+# Wall-clock + peak CPU RSS for one job
+/usr/bin/time -v python -m plm_benchmark.cli train \
+    --task peta_gb1 --method full_ft --model esm2_8m --seed 42 --gpu 1
+
+# In another shell, sample GPU memory/util every 0.5s while it runs, then take the max
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits -lms 500 | tee gpu.log
+sort -t, -k1 -n gpu.log | tail -1   # peak memory (MiB) observed
+```
+
+Read it as: high **peak memory** → smaller `--jobs`; low **utilization.gpu** → the
+GPU is idle and concurrency will help a lot. If per-epoch eval dominates (large
+val/test sets, `epochs=100`), also raise `--eval-every` and `--val-batch`.
+
+Pick concurrency: `jobs ≈ 0.9 × 80GB ÷ peak_mem_per_run`, then cap by CPU cores.
+For 8M/35M models this is usually 8–16, CPU-bound before memory-bound.
+
+### 2. (Optional) Enable NVIDIA MPS
+
+Default CUDA time-slices the GPU across processes; MPS lets their kernels run
+concurrently, which helps when each job underutilizes the GPU (our case).
+
+```bash
+export CUDA_VISIBLE_DEVICES=0                       # the physical GPU to share
+nvidia-cuda-mps-control -d                          # start the MPS daemon
+# ... run the launcher ...
+echo quit | nvidia-cuda-mps-control                 # stop it when done
+```
+
+Optionally cap per-client memory so one job can't starve the others:
+`export CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=8G`.
+
+### 3. Launch with bounded concurrency
+
+`scripts/run_benchmark.py` fans `(model × task × seed)` out over a thread pool of
+`--jobs` subprocesses, each a normal CLI `train` call. It lowers CPU threads
+(`OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `TOKENIZERS_PARALLELISM=false`) and
+sets `--num-workers 0` per job so K processes don't thrash the CPU. Per-job logs
+go to `outputs/logs/`; `experiments.csv` is append-locked so parallel writes are safe.
+
+```bash
+python scripts/run_benchmark.py \
+    --models esm2_8m,esm2_35m --task peta_all --seeds 42,43,44 \
+    --method full_ft --gpu 1 --jobs 8 --eval-every 5 --val-batch 64 \
+    --wandb_project pulm_ft --wandb_group sweep1
+```
+
+Tuning knobs:
+- `--jobs` — concurrent processes (start at 8, watch `nvidia-smi`, raise until memory/CPU saturate).
+- `--num-workers` — keep at 0–1 when `--jobs` is high.
+- `--eval-every` — evaluate/checkpoint every N epochs (see below).
+- `--val-batch` — larger eval/test batches use the H100 better (default 64).
+
+### Faster long runs: `--eval-every` and `--val-batch`
+
+`--eval-every N` evaluates and checkpoints every N epochs instead of every epoch,
+cutting large-val forward passes and checkpoint writes on 100-epoch runs. Default
+is 1 (unchanged behaviour). **Caveat:** early-stopping patience then counts *eval
+events*, not epochs — with PETA `patience=20` and `--eval-every 5`, that's 100
+epochs of no-improvement before stopping, so lower `--patience` accordingly.
+Coarser cadence also means the "best" checkpoint is chosen on a coarser grid, so
+use it for sweeps/exploration and `--eval-every 1` for final numbers.
+
 ## Common commands
 
 ```bash

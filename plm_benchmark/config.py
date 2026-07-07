@@ -46,7 +46,8 @@ CACHE_DIR = OUTPUTS_DIR / "embeddings"
 LOG_CSV = OUTPUTS_DIR / "experiments.csv"
 COMPARE_CSV = OUTPUTS_DIR / "comparison.csv"
 
-PULM_MODELS_ROOT = Path(os.environ.get("PULM_MODELS_ROOT", "/cta/share/users/PULM/models"))
+# PULM_MODELS_ROOT = Path(os.environ.get("PULM_MODELS_ROOT", "/cta/share/users/PULM/models"))
+PULM_MODELS_ROOT = Path(os.environ.get("PULM_MODELS_ROOT", "/shared/PULM/models"))
 
 RARE_AA = ["O", "B", "U", "Z", "J"]
 MAX_SEQ_LENGTH = 1024

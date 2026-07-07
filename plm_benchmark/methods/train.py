@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import math
 import os
 import random
 from dataclasses import dataclass
@@ -186,7 +187,8 @@ def run_downstream(
     seed: int,
     fp16: bool,
     max_length: int = MAX_SEQ_LENGTH,
-    val_batch: int = 16,
+    val_batch: int = 64,
+    eval_every: int = 1,
     patience: int | None = None,
     tokenizer_spec: str | None = None,
     scratch_dim: int = 320,
@@ -239,7 +241,7 @@ def run_downstream(
     )
     print(
         f"Train/valid: {len(train_df)}/{len(valid_df)} | epochs={epochs} lr={lr} wd={weight_decay} "
-        f"patience={stop_patience} | head=attention1d | metric={spec.metric}",
+        f"patience={stop_patience} eval_every={eval_every}ep | head=attention1d | metric={spec.metric}",
         flush=True,
     )
 
@@ -257,12 +259,29 @@ def run_downstream(
     else:
         collator = partial(collate_single, tokenizer=tokenizer, max_length=max_length, spec=spec)
 
+    # Eval/checkpoint cadence: every epoch by default (unchanged behaviour). When
+    # eval_every > 1, switch to a steps schedule so we eval + checkpoint every
+    # eval_every epochs (fewer large-val forward passes + fewer checkpoint writes).
+    if eval_every > 1:
+        steps_per_epoch = max(1, math.ceil(len(train_ds) / (batch * accum)))
+        total_steps = steps_per_epoch * epochs
+        # Ensure at least one eval happens, else load_best_model_at_end has nothing.
+        cadence_steps = min(eval_every * steps_per_epoch, total_steps)
+        cadence = dict(
+            eval_strategy="steps",
+            save_strategy="steps",
+            logging_strategy="steps",
+            eval_steps=cadence_steps,
+            save_steps=cadence_steps,
+            logging_steps=cadence_steps,
+        )
+    else:
+        cadence = dict(eval_strategy="epoch", save_strategy="epoch", logging_strategy="epoch")
+
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported() and not fp16
     ta_kwargs = dict(
         output_dir=str(run_dir / "hf_cache"),
-        eval_strategy="epoch",
-        logging_strategy="epoch",
-        save_strategy="epoch",
+        **cadence,
         load_best_model_at_end=True,
         metric_for_best_model=metric_for_best,
         greater_is_better=spec.greater_is_better,
