@@ -103,7 +103,7 @@ def main() -> None:
     p.add_argument("--task", required=True, help="Task name/list or group (all, peta_all, everything).")
     p.add_argument("--method", default="full_ft")
     p.add_argument("--seeds", default="42,43,44")
-    p.add_argument("--gpu", type=int, default=2, help="GPU id (1 = first device).")
+    p.add_argument("--gpu", type=int, default=1, help="GPU id (1 = first device).")
     p.add_argument("--jobs", type=int, default=4, help="Concurrent processes on the GPU.")
     p.add_argument("--num-workers", type=int, default=0, help="Per-job dataloader workers (keep low under high -j).")
     p.add_argument("--eval-every", type=int, default=1)

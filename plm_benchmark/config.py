@@ -52,9 +52,19 @@ PULM_MODELS_ROOT = Path(os.environ.get("PULM_MODELS_ROOT", "/shared/PULM/models"
 RARE_AA = ["O", "B", "U", "Z", "J"]
 MAX_SEQ_LENGTH = 1024
 
+# Learning rate by training *regime* (not by task source):
+#   full fine-tune of a pretrained encoder -> small (preserve pretrained weights)
+#   frozen encoder + head, or from-scratch encoder -> large (fresh params)
+#   LoRA adapters -> mid
 LR_FULL_FT = 2e-5
+LR_HEAD = 1e-3     # embed_head: frozen encoder, train head only
+LR_SCRATCH = 1e-3  # scratch baseline: random init, no weights to preserve
 LR_LORA = 3e-4
-LR_EMBED_HEAD = 1e-4
+
+# Unified downstream recipe — same for every task (Rost + PETA). CLI can override.
+MAX_EPOCHS = 50
+EARLY_STOPPING_PATIENCE = 10
+WEIGHT_DECAY = 0.01
 
 FINETUNE_SEEDS: tuple[int, ...] = (42, 43, 44)
 CHECKPOINT_POLICY = "best_val"

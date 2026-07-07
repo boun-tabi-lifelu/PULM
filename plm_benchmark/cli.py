@@ -3,7 +3,19 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 
-from plm_benchmark.config import DEFAULT_MODEL, FINETUNE_SEEDS, OUTPUTS_DIR, get_models, resolve_model
+from plm_benchmark.config import (
+    DEFAULT_MODEL,
+    EARLY_STOPPING_PATIENCE,
+    FINETUNE_SEEDS,
+    LR_FULL_FT,
+    LR_HEAD,
+    LR_LORA,
+    MAX_EPOCHS,
+    OUTPUTS_DIR,
+    WEIGHT_DECAY,
+    get_models,
+    resolve_model,
+)
 from plm_benchmark.methods import WandbConfig, run_downstream
 from plm_benchmark.results import append_experiment, build_comparison, load_experiments
 from plm_benchmark.tasks import TASKS, load_splits, resolve_tasks
@@ -114,7 +126,7 @@ def cmd_list_tasks(_: argparse.Namespace) -> None:
 
     print("=== Rost (Schmirler / Nat Commun 2024) ===")
     for name, spec in sorted((k, v) for k, v in TASKS.items() if v.data_source == "rost"):
-        print(f"  {name:10} {spec.task_type:14} metric={spec.metric} epochs={spec.finetune_epochs}")
+        print(f"  {name:10} {spec.task_type:14} metric={spec.metric}")
 
     print("\n=== PETA (ProteinPretraining) ===")
     for name, spec in sorted((k, v) for k, v in TASKS.items() if v.data_source == "peta"):
@@ -125,13 +137,19 @@ def cmd_list_tasks(_: argparse.Namespace) -> None:
         status = " [PPI: attention1d pool + sum]" if spec.task_type == "ppi" else ""
         print(
             f"  {name:22} {spec.task_type:14} labels={spec.num_labels:4} "
-            f"metric={spec.metric} epochs={spec.finetune_epochs}{split}{status}"
+            f"metric={spec.metric}{split}{status}"
         )
 
     print("\nAll tasks share one PyTorch pipeline: attention1d pooling + linear head.")
     print("  full_ft -> train encoder; embed_head -> freeze encoder (train head only); lora -> adapters.")
-    print("  Rost recipe: lr=2e-5, no early stopping. PETA recipe: lr=1e-3, wd=0.001, patience=20.")
-    print("\nData: Rost -> training data/   PETA -> training data/PETA/ft_datasets/  (see docs/PETA.md)")
+    print(
+        f"  Unified recipe (all tasks): max_epochs={MAX_EPOCHS}, patience={EARLY_STOPPING_PATIENCE}, "
+        f"weight_decay={WEIGHT_DECAY}."
+    )
+    print(
+        f"  LR by regime: full_ft={LR_FULL_FT}, embed_head/scratch={LR_HEAD}, lora={LR_LORA}."
+    )
+    print("\nData: Rost -> data/training data/   PETA -> data/ft_datasets/  (see plm_benchmark/README.md)")
 
 
 def cmd_list_models(_: argparse.Namespace) -> None:
@@ -161,7 +179,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="full_ft: train encoder; embed_head: freeze encoder; lora: adapters; "
         "full_ft_peta20: full_ft capped at 20 epochs",
     )
-    t.add_argument("--patience", type=int, default=None, help="Early-stopping patience (0 disables; overrides task recipe)")
+    t.add_argument(
+        "--patience",
+        type=int,
+        default=None,
+        help=f"Early-stopping patience in eval events (0 disables; default {EARLY_STOPPING_PATIENCE})",
+    )
     t.add_argument("--split-method", default=None, help="PETA split (e.g. one_vs_rest for peta_gb1)")
     t.add_argument("--model", default=DEFAULT_MODEL, help=f"Registry name or 'scratch' (default: {DEFAULT_MODEL})")
     t.add_argument("--checkpoint", default=None, help="Local checkpoint dir override")
@@ -172,7 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
         "a saved-tokenizer dir, or a hub id. Optional override for other models.",
     )
     t.add_argument("--gpu", type=int, default=1, help="GPU id (1 = first device)")
-    t.add_argument("--epochs", type=int, default=None)
+    t.add_argument("--epochs", type=int, default=None, help=f"Override max epochs (default {MAX_EPOCHS} for all tasks)")
     t.add_argument("--batch", type=int, default=64)
     t.add_argument("--val-batch", type=int, default=64)
     t.add_argument(

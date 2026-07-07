@@ -23,7 +23,18 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments, set_seed
 
-from plm_benchmark.config import CHECKPOINT_POLICY, LR_FULL_FT, LR_LORA, MAX_SEQ_LENGTH, OUTPUTS_DIR
+from plm_benchmark.config import (
+    CHECKPOINT_POLICY,
+    EARLY_STOPPING_PATIENCE,
+    LR_FULL_FT,
+    LR_HEAD,
+    LR_LORA,
+    LR_SCRATCH,
+    MAX_EPOCHS,
+    MAX_SEQ_LENGTH,
+    OUTPUTS_DIR,
+    WEIGHT_DECAY,
+)
 from plm_benchmark.methods.data import collate_ppi, collate_single, ppi_dataset, single_dataset
 from plm_benchmark.methods.metrics import metrics_fn, score_predictions
 from plm_benchmark.models import set_gpu
@@ -32,14 +43,7 @@ from plm_benchmark.results import append_experiment
 from plm_benchmark.tasks import TaskSpec, preprocess_ppi_splits, preprocess_sequences
 from plm_benchmark.tokenizers import resolve_tokenizer
 
-LR_EMBED_HEAD_TRAIN = 1e-3  # head-only lr for frozen-encoder (embed_head) runs
-
-METHOD_LR = {
-    "full_ft": LR_FULL_FT,
-    "full_ft_peta20": LR_FULL_FT,
-    "lora": LR_LORA,
-    "embed_head": LR_EMBED_HEAD_TRAIN,
-}
+METHODS = {"full_ft", "full_ft_peta20", "lora", "embed_head"}
 
 
 @dataclass
@@ -88,22 +92,25 @@ def _set_seeds(seed: int) -> None:
     set_seed(seed)
 
 
-def _resolve_epochs(spec: TaskSpec, method: str, epochs: int | None) -> int:
+def _resolve_epochs(method: str, epochs: int | None) -> int:
     if epochs:
         return epochs
     if method == "full_ft_peta20":
         return 20
-    if method == "embed_head":
-        return spec.embed_head_epochs
-    return spec.finetune_epochs
+    return MAX_EPOCHS
 
 
-def _resolve_lr(spec: TaskSpec, method: str, lr: float | None) -> float:
+def _resolve_lr(model_cfg, method: str, lr: float | None) -> float:
+    """LR by training regime, not by task source."""
     if lr is not None:
         return lr
-    if spec.lr is not None:
-        return spec.lr
-    return METHOD_LR[method]
+    if model_cfg.backend == "scratch":
+        return LR_SCRATCH  # random init: no pretrained weights to preserve
+    if method == "embed_head":
+        return LR_HEAD  # frozen encoder, train head only
+    if method == "lora":
+        return LR_LORA
+    return LR_FULL_FT  # full_ft / full_ft_peta20 on a pretrained encoder
 
 
 def _setup_wandb(cfg: WandbConfig | None, default_run_name: str, resume_from_checkpoint) -> tuple[list[str], str | None]:
@@ -199,8 +206,8 @@ def run_downstream(
     valid_df=None,
     test_df=None,
 ) -> dict:
-    if method not in METHOD_LR:
-        raise ValueError(f"Unknown method {method!r}. Choose from {sorted(METHOD_LR)}.")
+    if method not in METHODS:
+        raise ValueError(f"Unknown method {method!r}. Choose from {sorted(METHODS)}.")
     if method == "lora" and model_cfg.backend == "scratch":
         raise ValueError("lora is not applicable to the scratch baseline (no attention modules).")
 
@@ -208,10 +215,10 @@ def run_downstream(
     use_lora = method == "lora"
     is_ppi = spec.task_type == "ppi"
 
-    epochs = _resolve_epochs(spec, method, epochs)
-    lr = _resolve_lr(spec, method, lr)
-    weight_decay = spec.weight_decay
-    stop_patience = spec.patience if patience is None else patience
+    epochs = _resolve_epochs(method, epochs)
+    lr = _resolve_lr(model_cfg, method, lr)
+    weight_decay = WEIGHT_DECAY
+    stop_patience = EARLY_STOPPING_PATIENCE if patience is None else patience
     metric_for_best = f"eval_{spec.metric}"
 
     set_gpu(gpu)

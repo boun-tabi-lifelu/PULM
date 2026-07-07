@@ -48,12 +48,27 @@ list. PETA datasets with multiple partitions take `--split-method` (e.g. `one_vs
 | `lora` | LoRA adapters | Base frozen, adapters + head trained. |
 | `full_ft_peta20` | trained | `full_ft` capped at 20 epochs (PETA short budget). |
 
-**Recipe** comes from the task spec: Rost tasks use lr 2e-5, no early stopping; PETA tasks
-use the PETA protocol (lr 1e-3, weight-decay 1e-3, patience 20, up to 100 epochs). Override
-per run with `--lr`, `--epochs`, `--patience`.
+**One uniform recipe for every task** (Rost + PETA) — self-consistent by design, not a
+replication of either paper:
 
-> Note: Rost tasks now use the attention1d head (not the old HF classification head), so
-> absolute Rost numbers differ from earlier HF-head runs.
+- `max_epochs = 50`, early-stopping `patience = 10` (eval events), `weight_decay = 0.01`.
+- **Learning rate by training regime**, not by task source: full-fine-tuning a pretrained
+  encoder needs a small lr; a frozen head or a from-scratch encoder needs a large one.
+
+  | Regime | LR |
+  |--------|----|
+  | `full_ft` on a pretrained encoder | `2e-5` |
+  | `embed_head` (frozen) / `scratch` baseline | `1e-3` |
+  | `lora` | `3e-4` |
+
+Override per run with `--lr`, `--epochs`, `--patience`. `load_best_model_at_end` always
+reports the best-val checkpoint, so early stopping only saves compute.
+
+> Notes: Rost tasks now use the attention1d head (not the old HF classification head) and
+> the unified recipe, so absolute Rost/PETA numbers differ from earlier per-source runs —
+> that is the point. Since an "epoch" is not equal compute across tasks of very different
+> sizes, the meaningful comparison is **within a task, across tokenizers/models**, where
+> the data and recipe are identical.
 
 ## Models
 
@@ -138,7 +153,7 @@ sort -t, -k1 -n gpu.log | tail -1   # peak memory (MiB) observed
 
 Read it as: high **peak memory** → smaller `--jobs`; low **utilization.gpu** → the
 GPU is idle and concurrency will help a lot. If per-epoch eval dominates (large
-val/test sets, `epochs=100`), also raise `--eval-every` and `--val-batch`.
+val/test sets over many epochs), also raise `--eval-every` and `--val-batch`.
 
 Pick concurrency: `jobs ≈ 0.9 × 80GB ÷ peak_mem_per_run`, then cap by CPU cores.
 For 8M/35M models this is usually 8–16, CPU-bound before memory-bound.
@@ -182,9 +197,9 @@ Tuning knobs:
 ### Faster long runs: `--eval-every` and `--val-batch`
 
 `--eval-every N` evaluates and checkpoints every N epochs instead of every epoch,
-cutting large-val forward passes and checkpoint writes on 100-epoch runs. Default
+cutting large-val forward passes and checkpoint writes on long runs. Default
 is 1 (unchanged behaviour). **Caveat:** early-stopping patience then counts *eval
-events*, not epochs — with PETA `patience=20` and `--eval-every 5`, that's 100
+events*, not epochs — with the default `patience=10` and `--eval-every 5`, that's 50
 epochs of no-improvement before stopping, so lower `--patience` accordingly.
 Coarser cadence also means the "best" checkpoint is chosen on a coarser grid, so
 use it for sweeps/exploration and `--eval-every 1` for final numbers.

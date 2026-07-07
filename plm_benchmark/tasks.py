@@ -13,33 +13,29 @@ PER_PROTEIN_TASKS = ["GB1", "AAV", "GFP", "Meltome", "Stab", "SubLoc"]
 
 @dataclass(frozen=True)
 class TaskSpec:
+    """Task identity only. The training recipe (lr, epochs, patience, weight
+    decay) is uniform across all tasks — see config.py and methods/train.py."""
+
     name: str
     folder: str
     seq_col: str
     label_col: str
     task_type: str  # regression | classification | multilabel | ppi
     num_labels: int
-    finetune_epochs: int
-    embed_head_epochs: int
     metric: str  # spearmanr | accuracy | mse
     greater_is_better: bool = True
     data_source: str = "rost"  # rost | peta
     peta_key: str | None = None
     default_split: str | None = None
-    # Recipe (per task). Rost defaults below; PETA overrides in peta_tasks.py.
-    lr: float | None = None  # None -> method default (see methods/train.py)
-    weight_decay: float = 0.0
-    patience: int = 0  # 0 disables early stopping
-    head_type: str = "attention1d"
 
 
 TASKS: dict[str, TaskSpec] = {
-    "GB1": TaskSpec("GB1", "GB1", "primary", "gb1_score", "regression", 1, 20, 240, "spearmanr"),
-    "AAV": TaskSpec("AAV", "AAV", "primary", "aav_score", "regression", 1, 10, 120, "spearmanr"),
-    "GFP": TaskSpec("GFP", "GFP", "primary", "fluor_score", "regression", 1, 20, 240, "spearmanr"),
-    "Meltome": TaskSpec("Meltome", "Meltome", "primary", "thermo_score", "regression", 1, 10, 120, "spearmanr"),
-    "Stab": TaskSpec("Stab", "Stab", "primary", "stability_score", "regression", 1, 10, 120, "spearmanr"),
-    "SubLoc": TaskSpec("SubLoc", "SubLoc", "Sequence", "loc_num", "classification", 10, 10, 120, "accuracy"),
+    "GB1": TaskSpec("GB1", "GB1", "primary", "gb1_score", "regression", 1, "spearmanr"),
+    "AAV": TaskSpec("AAV", "AAV", "primary", "aav_score", "regression", 1, "spearmanr"),
+    "GFP": TaskSpec("GFP", "GFP", "primary", "fluor_score", "regression", 1, "spearmanr"),
+    "Meltome": TaskSpec("Meltome", "Meltome", "primary", "thermo_score", "regression", 1, "spearmanr"),
+    "Stab": TaskSpec("Stab", "Stab", "primary", "stability_score", "regression", 1, "spearmanr"),
+    "SubLoc": TaskSpec("SubLoc", "SubLoc", "Sequence", "loc_num", "classification", 10, "accuracy"),
 }
 
 
