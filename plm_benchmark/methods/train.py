@@ -8,6 +8,7 @@ comes from the task spec, so Rost and PETA differ only by configuration.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import os
 import random
@@ -49,6 +50,34 @@ class WandbConfig:
     mode: str = "online"
     run_id: str | None = None
     resume: str = "allow"
+
+
+def make_training_args(kwargs: dict) -> TrainingArguments:
+    """Build TrainingArguments across transformers versions.
+
+    Field names drift between releases (e.g. the boolean ``group_by_length``
+    became ``train_sampling_strategy="group_by_length"`` in v5, and
+    ``evaluation_strategy`` became ``eval_strategy``). Map known renames, then
+    drop anything the installed version doesn't accept.
+    """
+    valid = {f.name for f in dataclasses.fields(TrainingArguments) if f.init}
+    kwargs = dict(kwargs)
+
+    # group_by_length (bool, <=v4)  <->  train_sampling_strategy (str, >=v5)
+    if "group_by_length" in kwargs and "group_by_length" not in valid:
+        grouped = kwargs.pop("group_by_length")
+        if "train_sampling_strategy" in valid:
+            kwargs["train_sampling_strategy"] = "group_by_length" if grouped else "random"
+
+    # eval_strategy (>=4.41)  <->  evaluation_strategy (older)
+    if "eval_strategy" in kwargs and "eval_strategy" not in valid and "evaluation_strategy" in valid:
+        kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
+
+    dropped = [k for k in list(kwargs) if k not in valid]
+    for k in dropped:
+        print(f"  (dropping TrainingArguments kwarg unsupported by this transformers version: {k})", flush=True)
+        kwargs.pop(k)
+    return TrainingArguments(**kwargs)
 
 
 def _set_seeds(seed: int) -> None:
@@ -255,8 +284,6 @@ def run_downstream(
         report_to=report_to,
         run_name=run_name,
     )
-    if "evaluation_strategy" in inspect.signature(TrainingArguments.__init__).parameters:
-        ta_kwargs["evaluation_strategy"] = ta_kwargs.pop("eval_strategy")
 
     callbacks = []
     if stop_patience and stop_patience > 0:
@@ -264,7 +291,7 @@ def run_downstream(
 
     trainer_kwargs = dict(
         model=model,
-        args=TrainingArguments(**ta_kwargs),
+        args=make_training_args(ta_kwargs),
         train_dataset=train_ds,
         eval_dataset=valid_ds,
         data_collator=collator,
