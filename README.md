@@ -1,49 +1,47 @@
-# PULM
-Protein Units Language Modeling
+# PULM — Protein Units Language Modeling
 
-Replication code for [Rost et al., Nat Commun 2024](https://www.nature.com/articles/s41467-024-51844-2) ([upstream data repo](https://github.com/RSchmirler/data-repo_plm-finetune-eval)) and the [PETA](https://github.com/mingchen-li/ProteinPretraining) protein-tokenizer tasks.
+PULM studies how the **tokenizer** shapes protein language models (PLMs). Standard
+ESM-2 uses a single-residue (amino-acid) tokenizer; PULM trains and evaluates ESM-2-style
+models under larger-vocabulary tokenizers (**BPE** and **PUMA**, multi-residue units) to
+measure the effect of sub-word segmentation on protein modeling.
 
-**One PyTorch pipeline for every task** (Rost + PETA), all sharing an attention1d pooling + linear head. Modes:
+The repository covers the full lifecycle: build a tokenizer, pretrain (or adapt) a model
+under it, then fine-tune and evaluate on downstream tasks.
 
-- `full_ft` — train the encoder + head.
-- `embed_head` — freeze the encoder, train the head only.
-- `lora` — LoRA adapters on the encoder + head.
-- `full_ft_peta20` — `full_ft` capped at 20 epochs (PETA short-budget scenario).
+## Components
 
-Per-task recipe (lr / epochs / weight-decay / early-stopping) comes from the task spec: Rost tasks keep the Rost recipe (lr 2e-5, no early stopping), PETA tasks use the PETA protocol (lr 1e-3, wd 0.001, patience 20). Rost tasks now run through the attention1d head (not the old HF classification head), so absolute Rost numbers differ from earlier HF-head runs.
-
-**Tokenizer-only baseline:** prefix any model with `scratch_` (e.g. `scratch_esm2_8m`) to train a randomly-initialised embedding encoder that borrows that model's tokenizer — isolating the tokenizer's effect from pretraining. Set `--scratch-dim` for the embedding size (default 320).
+| Directory | Purpose |
+|-----------|---------|
+| [`plm_train/`](plm_train/train.py) | Pretrain ESM-2-shaped models (masked-LM) **from scratch** under a chosen tokenizer (AA / BPE / PUMA). |
+| [`plm_cont_train/`](plm_cont_train/train.py) | **Continual** pretraining: start from released ESM-2 weights and keep training, optionally after swapping the tokenizer. |
+| [`plm_vocab_expansion/`](plm_vocab_expansion/README.md) | Cost-efficient adaptation of pretrained ESM-2 to a new, larger tokenizer without training from scratch. |
+| [`plm_benchmark/`](plm_benchmark/README.md) | **Downstream fine-tuning & evaluation** — one unified PyTorch pipeline over the Rost and PETA task suites. See its README. |
+| `scripts/` | Data prep (UniRef50 splits, PETA dataset setup). |
+| `outputs/` | Run logs (`experiments.csv`, `comparison.csv`) and local weights. |
 
 ## Setup
 
 ```bash
 conda env create -f environment.yml
 conda activate finetune
-unzip -q "training data.zip"
 ```
 
-## Run
+## Downstream evaluation (quick start)
+
+All fine-tuning is driven by the `plm_benchmark` CLI:
 
 ```bash
-python run.py train --task GB1 --method full_ft --model esm2_8m --gpu 2
-python run.py train --task peta_gb1 --method embed_head --model esm2_8m --gpu 2
-python run.py train --task peta_gb1 --method full_ft --model scratch_esm2_8m --gpu 2   # baseline
-python run.py train --task GB1 --method full_ft --model esm2_8m --wandb_project pulm    # wandb
-python run.py compare
-python run.py list
+python -m plm_benchmark.cli list-tasks
+python -m plm_benchmark.cli train --task GB1 --method full_ft --model esm2_8m --gpu 2
+python -m plm_benchmark.cli compare
 ```
 
-wandb: pass `--wandb_project` to log train/eval loss and task metrics per run (`--wandb_run_name`, `--wandb_group`, `--wandb_entity`, `--wandb_mode`, and `--wandb_run_id`/`--wandb_resume` with `--resume-from-checkpoint` to continue a run).
+See [`plm_benchmark/README.md`](plm_benchmark/README.md) for the task suites, training
+modes, the from-scratch tokenizer baseline, and wandb logging.
 
-Scores: `outputs/experiments.csv` (now includes a `split` column). Comparison table: `outputs/comparison.csv`. Run dir + weights: `outputs/<model>/<task>/<split>/<method>/seed_<n>/`.
+## Data
 
-## Repo layout
+Two downstream task collections are used (see `plm_benchmark/README.md` for layout):
 
-| Path | Purpose |
-|------|---------|
-| `run.py`, `plm_benchmark/` | CLI replication pipeline |
-| `environment.yml` | Conda env |
-| `training data.zip` | Task splits (unzip → `training data/`) |
-| `outputs/` | Run logs (CSVs committed; weights/embeddings local) |
-
-Per-residue tasks (SecStr, Disorder) are in `notebooks/` and `training data/SecStr/`, not in `run.py` yet. (Will be included soon!)
+- **Rost / FLIP** — [RSchmirler/data-repo_plm-finetune-eval](https://github.com/RSchmirler/data-repo_plm-finetune-eval)
+- **PETA** — [mingchen-li/ProteinPretraining](https://github.com/mingchen-li/ProteinPretraining)

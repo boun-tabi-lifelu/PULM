@@ -28,6 +28,7 @@ from plm_benchmark.models import set_gpu
 from plm_benchmark.models.peta_classifier import build_model
 from plm_benchmark.results import append_experiment
 from plm_benchmark.tasks import TaskSpec, preprocess_ppi_splits, preprocess_sequences
+from plm_benchmark.tokenizers import resolve_tokenizer
 
 LR_EMBED_HEAD_TRAIN = 1e-3  # head-only lr for frozen-encoder (embed_head) runs
 
@@ -158,6 +159,7 @@ def run_downstream(
     max_length: int = MAX_SEQ_LENGTH,
     val_batch: int = 16,
     patience: int | None = None,
+    tokenizer_spec: str | None = None,
     scratch_dim: int = 320,
     num_workers: int = 4,
     wandb_cfg: WandbConfig | None = None,
@@ -212,8 +214,14 @@ def run_downstream(
         flush=True,
     )
 
+    tokenizer_obj = resolve_tokenizer(tokenizer_spec, max_length=max_length) if tokenizer_spec else None
     model, tokenizer = build_model(
-        model_cfg, spec, freeze=freeze, use_lora=use_lora, scratch_dim=scratch_dim
+        model_cfg,
+        spec,
+        tokenizer=tokenizer_obj,
+        freeze=freeze,
+        use_lora=use_lora,
+        scratch_dim=scratch_dim,
     )
     if is_ppi:
         collator = partial(collate_ppi, tokenizer=tokenizer, max_length=max_length)

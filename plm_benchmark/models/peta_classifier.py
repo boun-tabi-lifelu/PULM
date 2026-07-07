@@ -79,16 +79,22 @@ def build_model(
     model_cfg: ModelConfig,
     spec: TaskSpec,
     *,
+    tokenizer=None,
     freeze: bool = False,
     use_lora: bool = False,
     scratch_dim: int = 320,
     lora_r: int = 4,
 ) -> tuple[EsmPetaClassifier, AutoTokenizer]:
-    """Assemble encoder + attention1d head for any task/backend."""
-    tokenizer = AutoTokenizer.from_pretrained(model_cfg.checkpoint)
+    """Assemble encoder + attention1d head for any task/backend.
+
+    ``tokenizer`` (an explicit object) is required for the scratch baseline and
+    optional otherwise (defaults to the checkpoint's own tokenizer).
+    """
     is_ppi = spec.task_type == "ppi"
 
     if model_cfg.backend == "scratch":
+        if tokenizer is None:
+            raise ValueError("The scratch baseline requires an explicit tokenizer (--tokenizer).")
         from plm_benchmark.models.scratch import ScratchEncoder
 
         encoder = ScratchEncoder(
@@ -97,6 +103,8 @@ def build_model(
             pad_token_id=tokenizer.pad_token_id,
         )
     else:
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(model_cfg.checkpoint)
         model_type = AutoConfig.from_pretrained(model_cfg.checkpoint).model_type
         enc_kwargs: dict = {"add_pooling_layer": False} if model_type == "esm" else {}
         encoder = AutoModel.from_pretrained(model_cfg.checkpoint, **enc_kwargs)

@@ -30,7 +30,7 @@ def _wandb_cfg(args: argparse.Namespace) -> WandbConfig:
 
 
 def cmd_train(args: argparse.Namespace) -> None:
-    model_cfg = resolve_model(args.model, args.checkpoint)
+    model_cfg = resolve_model(args.model, args.checkpoint, tokenizer=args.tokenizer)
     tasks = resolve_tasks(args.task)
     seeds = _parse_seeds(args)
     wandb_cfg = _wandb_cfg(args)
@@ -56,6 +56,7 @@ def cmd_train(args: argparse.Namespace) -> None:
                     max_length=args.max_length,
                     val_batch=args.val_batch,
                     patience=args.patience,
+                    tokenizer_spec=args.tokenizer,
                     scratch_dim=args.scratch_dim,
                     num_workers=args.num_workers,
                     wandb_cfg=wandb_cfg,
@@ -94,7 +95,7 @@ def cmd_list(_: argparse.Namespace) -> None:
     pulm = [k for k, v in models.items() if v.source == "pulm"]
     print("Hub models:", ", ".join(hub))
     print(f"PULM models: {len(pulm)} discovered (use list-models)")
-    print("Scratch baseline: prefix any model with scratch_ (e.g. scratch_esm2_8m)")
+    print("Scratch baseline: --model scratch --tokenizer <esm2 | tokenizer.json | dir | hub-id>")
     print("Rost tasks:", ", ".join(t for t in TASKS if not t.startswith("peta_")))
     print("PETA tasks:", ", ".join(t for t in TASKS if t.startswith("peta_")))
     print("Task groups: all (Rost only), peta_all, everything")
@@ -161,8 +162,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     t.add_argument("--patience", type=int, default=None, help="Early-stopping patience (0 disables; overrides task recipe)")
     t.add_argument("--split-method", default=None, help="PETA split (e.g. one_vs_rest for peta_gb1)")
-    t.add_argument("--model", default=DEFAULT_MODEL, help=f"Registry name or scratch_<name> (default: {DEFAULT_MODEL})")
+    t.add_argument("--model", default=DEFAULT_MODEL, help=f"Registry name or 'scratch' (default: {DEFAULT_MODEL})")
     t.add_argument("--checkpoint", default=None, help="Local checkpoint dir override")
+    t.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Tokenizer for --model scratch (required): 'esm2', a tokenizer.json path, "
+        "a saved-tokenizer dir, or a hub id. Optional override for other models.",
+    )
     t.add_argument("--gpu", type=int, default=2, help="GPU id (1 = first device)")
     t.add_argument("--epochs", type=int, default=None)
     t.add_argument("--batch", type=int, default=8)
@@ -219,3 +226,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -72,7 +72,7 @@ def resolve_tasks(task_arg: str) -> list[str]:
     if unknown:
         raise ValueError(
             f"Unknown task(s): {unknown}. "
-            f"Rost: {PER_PROTEIN_TASKS}. PETA: use peta_* or peta_all. Run: python run.py list-tasks"
+            f"Rost: {PER_PROTEIN_TASKS}. PETA: use peta_* or peta_all. Run: python -m plm_benchmark.cli list-tasks"
         )
     return names
 

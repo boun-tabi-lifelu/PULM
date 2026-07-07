@@ -7,22 +7,40 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "training data"
+PKG_DIR = Path(__file__).resolve().parent
+ROOT = PKG_DIR.parent
+# Recommended layout: plm_benchmark/data/{training data, ft_datasets}
+DATA_ROOT = PKG_DIR / "data"
 
 
-def _default_peta_data_dir() -> Path:
-    candidates = [
-        ROOT / "training data" / "PETA" / "ft_datasets",
-        ROOT / "ft_datasets",
-    ]
+def _first_dir(candidates: list[Path], default: Path) -> Path:
     for path in candidates:
         if path.is_dir():
             return path
-    return candidates[-1]
+    return default
 
 
-PETA_DATA_DIR = Path(os.environ.get("PETA_DATA_DIR", str(_default_peta_data_dir())))
+def _default_rost_data_dir() -> Path:
+    return _first_dir(
+        [DATA_ROOT / "training data", ROOT / "training data"],
+        DATA_ROOT / "training data",
+    )
+
+
+def _default_peta_data_dir() -> Path:
+    return _first_dir(
+        [
+            DATA_ROOT / "ft_datasets",
+            DATA_ROOT / "training data" / "PETA" / "ft_datasets",
+            ROOT / "training data" / "PETA" / "ft_datasets",
+            ROOT / "ft_datasets",
+        ],
+        DATA_ROOT / "ft_datasets",
+    )
+
+
+DATA_DIR = Path(os.environ["ROST_DATA_DIR"]) if os.environ.get("ROST_DATA_DIR") else _default_rost_data_dir()
+PETA_DATA_DIR = Path(os.environ["PETA_DATA_DIR"]) if os.environ.get("PETA_DATA_DIR") else _default_peta_data_dir()
 OUTPUTS_DIR = ROOT / "outputs"
 CACHE_DIR = OUTPUTS_DIR / "embeddings"
 LOG_CSV = OUTPUTS_DIR / "experiments.csv"
@@ -87,13 +105,24 @@ def get_models() -> dict[str, ModelConfig]:
     return {**HUB_MODELS, **discover_pulm_models()}
 
 
-def resolve_model(name: str | None = None, checkpoint: str | None = None) -> ModelConfig:
+def resolve_model(
+    name: str | None = None,
+    checkpoint: str | None = None,
+    tokenizer: str | None = None,
+) -> ModelConfig:
     models = get_models()
 
-    # scratch_<model>: randomly-initialised baseline that borrows <model>'s tokenizer.
-    if name and name.startswith("scratch_"):
-        base = resolve_model(name[len("scratch_") :], checkpoint)
-        return ModelConfig(name=name, checkpoint=base.checkpoint, backend="scratch", source="scratch")
+    # scratch: randomly-initialised baseline. The tokenizer is supplied separately
+    # (--tokenizer) and names the run, e.g. scratch_esm2 / scratch_<json-stem>.
+    if name == "scratch":
+        from plm_benchmark.tokenizers import tokenizer_label
+
+        return ModelConfig(
+            name=f"scratch_{tokenizer_label(tokenizer)}",
+            checkpoint=checkpoint or "",
+            backend="scratch",
+            source="scratch",
+        )
 
     if checkpoint:
         ckpt = str(Path(checkpoint).resolve())
@@ -112,5 +141,8 @@ def resolve_model(name: str | None = None, checkpoint: str | None = None) -> Mod
 
     if not name or name not in models:
         available = ", ".join(sorted(models)[:8])
-        raise ValueError(f"Unknown model '{name}'. Examples: {available} ... (run: python run.py list-models)")
+        raise ValueError(
+            f"Unknown model '{name}'. Examples: {available} ... "
+            "(run: python -m plm_benchmark.cli list-models)"
+        )
     return models[name]
