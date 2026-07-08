@@ -95,8 +95,37 @@ python -m plm_benchmark.cli train --task peta_gb1 --method full_ft \
 ```
 
 `--tokenizer` accepts: `esm2`, a `tokenizer.json` path, a saved-tokenizer directory, or a
-Hub id. `--scratch-dim` sets the embedding size (default 320, matching ESM2-8M). The run is
-named `scratch_<tokenizer-label>`.
+Hub id. `--scratch-dim` sets the embedding/hidden size (default 320, matching ESM2-8M). The
+run is named `scratch_<tokenizer-label>`.
+
+#### Baseline capacity: `--scratch-layers` / `--scratch-heads`
+
+The scratch encoder's strength is a dial. The shared attention1d pooling + linear head is
+unchanged in every case, so only the encoder differs from a real PLM.
+
+- **`--scratch-layers 0` (default) — bag-of-tokens floor.** Token embedding + positional
+  embedding + LayerNorm, then straight to pooling. No token ever sees another token, so it
+  measures *only* the signal the vocabulary carries on its own. It is a deliberately weak
+  floor: because it cannot model interactions between tokens (e.g. epistasis between
+  mutated positions), the gap to a PLM here over-attributes performance to pretraining.
+- **`--scratch-layers 1` or `2` — small non-pretrained model with context.** Adds that many
+  Transformer blocks (self-attention + FFN + LayerNorm), so tokens interact. This is a
+  *fairer* control: the difference from a PLM is now closer to "pretrained weights" rather
+  than "architecture." `--scratch-heads` sets attention heads per block (default 8) and must
+  divide `--scratch-dim` (320 ÷ 8 = 40 ✓). More layers/heads = more capacity and a stronger
+  baseline, but also a larger model that takes longer and drifts further from "just the
+  tokenizer."
+
+Recommended: report **both** — `--scratch-layers 0` (floor) and `--scratch-layers 1-2`
+(fair small model). Seeing how much one or two blocks of context close the gap is itself
+informative: it shows whether a tokenizer's advantage survives once the model can mix tokens.
+
+```bash
+# Floor (bag-of-tokens) and a 2-layer contextual baseline, same tokenizer
+python -m plm_benchmark.cli train --task peta_gb1 --method full_ft --model scratch --tokenizer esm2
+python -m plm_benchmark.cli train --task peta_gb1 --method full_ft --model scratch --tokenizer esm2 \
+    --scratch-layers 2 --scratch-heads 8
+```
 
 ## Weights & Biases
 
@@ -175,17 +204,21 @@ Optionally cap per-client memory so one job can't starve the others:
 
 ### 3. Launch with bounded concurrency
 
-`scripts/run_benchmark.py` fans `(model × task × seed)` out over a thread pool of
+`plm_benchmark/run_benchmark.py` fans `(model × task × seed)` out over a thread pool of
 `--jobs` subprocesses, each a normal CLI `train` call. It lowers CPU threads
 (`OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `TOKENIZERS_PARALLELISM=false`) and
 sets `--num-workers 0` per job so K processes don't thrash the CPU. Per-job logs
 go to `outputs/logs/`; `experiments.csv` is append-locked so parallel writes are safe.
 
 ```bash
-python scripts/run_benchmark.py \
+python -m plm_benchmark.run_benchmark \
     --models esm2_8m,esm2_35m --task peta_all --seeds 42,43,44 \
     --method full_ft --gpu 1 --jobs 8 --eval-every 5 --val-batch 64 \
     --wandb_project pulm_ft --wandb_group sweep1
+
+# scratch baselines are controllable from the launcher too:
+python -m plm_benchmark.run_benchmark --models scratch --tokenizer esm2 \
+    --task peta_all --scratch-layers 2 --scratch-heads 8 --gpu 1 --jobs 8
 ```
 
 Tuning knobs:
@@ -193,6 +226,7 @@ Tuning knobs:
 - `--num-workers` — keep at 0–1 when `--jobs` is high.
 - `--eval-every` — evaluate/checkpoint every N epochs (see below).
 - `--val-batch` — larger eval/test batches use the H100 better (default 64).
+- `--scratch-dim` / `--scratch-layers` / `--scratch-heads` — scratch-baseline capacity (see the scratch section).
 
 ### Faster long runs: `--eval-every` and `--val-batch`
 

@@ -6,11 +6,16 @@ CLI. A thread pool keeps --jobs of them in flight at once; the GPU is shared
 (time-sliced, or better via NVIDIA MPS — see the README). Results are written to
 outputs/experiments.csv, which is append-locked so concurrent writers are safe.
 
-Example:
-    python scripts/run_benchmark.py \
+Examples:
+    # Sweep two PLMs over all PETA tasks
+    python -m plm_benchmark.run_benchmark \
         --models esm2_8m,esm2_35m --task peta_all --seeds 42,43,44 \
-        --method full_ft --gpu 2 --jobs 8 --eval-every 5 \
-        --wandb_project pulm_ft
+        --method full_ft --gpu 1 --jobs 8 --eval-every 5 --wandb_project pulm_ft
+
+    # Scratch tokenizer baseline, 2-layer contextual variant
+    python -m plm_benchmark.run_benchmark \
+        --models scratch --tokenizer esm2 --task peta_all \
+        --scratch-layers 2 --scratch-heads 8 --gpu 1 --jobs 8
 
 Per-job stdout/stderr goes to outputs/logs/<job>.log; the console shows a
 one-line PASS/FAIL summary per job.
@@ -26,6 +31,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+# Repo root (holds the plm_benchmark package); child jobs run `-m plm_benchmark.cli` from here.
 ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = ROOT / "outputs" / "logs"
 
@@ -62,6 +68,9 @@ def job_cmd(job: dict, args) -> list[str]:
         "--eval-every", str(args.eval_every),
         "--batch", str(args.batch),
         "--val-batch", str(args.val_batch),
+        "--scratch-dim", str(args.scratch_dim),
+        "--scratch-layers", str(args.scratch_layers),
+        "--scratch-heads", str(args.scratch_heads),
     ]
     if args.tokenizer:
         cmd += ["--tokenizer", args.tokenizer]
@@ -111,6 +120,14 @@ def main() -> None:
     p.add_argument("--val-batch", type=int, default=64)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--tokenizer", default=None, help="For --models scratch.")
+    p.add_argument("--scratch-dim", type=int, default=320, help="Scratch embedding/hidden dim.")
+    p.add_argument(
+        "--scratch-layers",
+        type=int,
+        default=0,
+        help="Scratch Transformer blocks: 0 = bag-of-tokens floor; 1-2 = small model with context.",
+    )
+    p.add_argument("--scratch-heads", type=int, default=8, help="Attention heads per scratch block (must divide --scratch-dim).")
     p.add_argument("--split-method", default=None)
     p.add_argument("--wandb_project", default=None)
     p.add_argument("--wandb_group", default=None)

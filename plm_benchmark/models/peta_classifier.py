@@ -83,6 +83,8 @@ def build_model(
     freeze: bool = False,
     use_lora: bool = False,
     scratch_dim: int = 320,
+    scratch_layers: int = 0,
+    scratch_heads: int = 8,
     lora_r: int = 4,
 ) -> tuple[EsmPetaClassifier, AutoTokenizer]:
     """Assemble encoder + attention1d head for any task/backend.
@@ -100,6 +102,8 @@ def build_model(
         encoder = ScratchEncoder(
             vocab_size=len(tokenizer),
             hidden_size=scratch_dim,
+            num_layers=scratch_layers,
+            num_heads=scratch_heads,
             pad_token_id=tokenizer.pad_token_id,
         )
     else:

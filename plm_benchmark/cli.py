@@ -71,6 +71,8 @@ def cmd_train(args: argparse.Namespace) -> None:
                     patience=args.patience,
                     tokenizer_spec=args.tokenizer,
                     scratch_dim=args.scratch_dim,
+                    scratch_layers=args.scratch_layers,
+                    scratch_heads=args.scratch_heads,
                     num_workers=args.num_workers,
                     wandb_cfg=wandb_cfg,
                     resume_from_checkpoint=args.resume_from_checkpoint,
@@ -215,7 +217,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     t.add_argument("--no-fp16", action="store_true")
     t.add_argument("--max-length", type=int, default=1024)
-    t.add_argument("--scratch-dim", type=int, default=320, help="Embedding dim for scratch_ baselines")
+    t.add_argument("--scratch-dim", type=int, default=320, help="Embedding/hidden dim for the scratch baseline")
+    t.add_argument(
+        "--scratch-layers",
+        type=int,
+        default=0,
+        help="Transformer blocks in the scratch encoder. 0 = bag-of-tokens (embedding + "
+        "LayerNorm + pooling; no token↔token context — a clean floor). 1-2 = a small "
+        "non-pretrained model with context (fairer baseline; token interaction).",
+    )
+    t.add_argument(
+        "--scratch-heads",
+        type=int,
+        default=8,
+        help="Attention heads per scratch Transformer block (used when --scratch-layers>0; "
+        "must divide --scratch-dim).",
+    )
     t.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     t.add_argument("--resume-from-checkpoint", default=None, help="Path to a Trainer checkpoint to resume")
 

@@ -199,6 +199,8 @@ def run_downstream(
     patience: int | None = None,
     tokenizer_spec: str | None = None,
     scratch_dim: int = 320,
+    scratch_layers: int = 0,
+    scratch_heads: int = 8,
     num_workers: int = 4,
     wandb_cfg: WandbConfig | None = None,
     resume_from_checkpoint: str | None = None,
@@ -260,6 +262,8 @@ def run_downstream(
         freeze=freeze,
         use_lora=use_lora,
         scratch_dim=scratch_dim,
+        scratch_layers=scratch_layers,
+        scratch_heads=scratch_heads,
     )
     if is_ppi:
         collator = partial(collate_ppi, tokenizer=tokenizer, max_length=max_length)
