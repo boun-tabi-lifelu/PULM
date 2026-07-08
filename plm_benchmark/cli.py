@@ -82,11 +82,14 @@ def cmd_train(args: argparse.Namespace) -> None:
                 )
             except Exception as e:
                 print(f"FAILED {name} seed={seed}: {e}")
+                now = datetime.now(timezone.utc).isoformat()
                 append_experiment(
                     {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "start_datetime": now,
+                        "end_datetime": now,
                         "task": name,
                         "model": model_cfg.name,
+                        "full_name": model_cfg.name,
                         "checkpoint": model_cfg.checkpoint,
                         "method": f"{args.method}_error",
                         "split": split or "default",
@@ -110,7 +113,7 @@ def cmd_list(_: argparse.Namespace) -> None:
     pulm = [k for k, v in models.items() if v.source == "pulm"]
     print("Hub models:", ", ".join(hub))
     print(f"PULM models: {len(pulm)} discovered (use list-models)")
-    print("Scratch baseline: --model scratch --tokenizer <esm2 | tokenizer.json | dir | hub-id>")
+    print("Scratch baseline: --model scratch --tokenizer <aa | tokenizer.json | dir | hub-id>")
     print("Rost tasks:", ", ".join(t for t in TASKS if not t.startswith("peta_")))
     print("PETA tasks:", ", ".join(t for t in TASKS if t.startswith("peta_")))
     print("Task groups: all (Rost only), peta_all, everything")
@@ -193,8 +196,8 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument(
         "--tokenizer",
         default=None,
-        help="Tokenizer for --model scratch (required): 'esm2', a tokenizer.json path, "
-        "a saved-tokenizer dir, or a hub id. Optional override for other models.",
+        help="Tokenizer for --model scratch (required): 'aa' (amino-acid/ESM-2 tokenizer), "
+        "a tokenizer.json path, a saved-tokenizer dir, or a hub id. Optional override for other models.",
     )
     t.add_argument("--gpu", type=int, default=1, help="GPU id (1 = first device)")
     t.add_argument("--epochs", type=int, default=None, help=f"Override max epochs (default {MAX_EPOCHS} for all tasks)")

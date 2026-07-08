@@ -85,18 +85,20 @@ A randomly-initialised embedding encoder isolates the tokenizer's effect from pr
 It shares the exact same head and training recipe, so any score delta reflects the tokenizer.
 
 ```bash
-# ESM-2 tokenizer (same across all sizes)
+# Amino-acid (ESM-2) tokenizer — same across all sizes
 python -m plm_benchmark.cli train --task peta_gb1 --method full_ft \
-    --model scratch --tokenizer esm2
+    --model scratch --tokenizer aa
 
 # A raw tokenizers JSON (PUMA/BPE) — wrapped with ESM-2 specials + <cls>..<eos>
 python -m plm_benchmark.cli train --task peta_gb1 --method full_ft \
     --model scratch --tokenizer /path/to/hf_uniref50_bpe_6400.json --scratch-dim 320
 ```
 
-`--tokenizer` accepts: `esm2`, a `tokenizer.json` path, a saved-tokenizer directory, or a
-Hub id. `--scratch-dim` sets the embedding/hidden size (default 320, matching ESM2-8M). The
-run is named `scratch_<tokenizer-label>`.
+`--tokenizer` accepts: `aa` (amino-acid/ESM-2 tokenizer; `esm2` is an accepted alias), a
+`tokenizer.json` path, a saved-tokenizer directory, or a Hub id. `--scratch-dim` sets the
+embedding/hidden size (default 320, matching ESM2-8M). The run is named
+`scratch_<tokenizer-label>` (so `--tokenizer aa` → `scratch_AA`, matching the `AA` tokenizer
+label used for hub/PULM amino-acid models).
 
 #### Baseline capacity: `--scratch-layers` / `--scratch-heads`
 
@@ -122,8 +124,8 @@ informative: it shows whether a tokenizer's advantage survives once the model ca
 
 ```bash
 # Floor (bag-of-tokens) and a 2-layer contextual baseline, same tokenizer
-python -m plm_benchmark.cli train --task peta_gb1 --method full_ft --model scratch --tokenizer esm2
-python -m plm_benchmark.cli train --task peta_gb1 --method full_ft --model scratch --tokenizer esm2 \
+python -m plm_benchmark.cli train --task peta_gb1 --method full_ft --model scratch --tokenizer aa
+python -m plm_benchmark.cli train --task peta_gb1 --method full_ft --model scratch --tokenizer aa \
     --scratch-layers 2 --scratch-heads 8
 ```
 
@@ -155,10 +157,19 @@ root are still detected as a fallback.)
 
 ## Outputs
 
-- `outputs/experiments.csv` — one row per run (now includes a `split` column).
-- `outputs/comparison.csv` — aggregated mean/std per `(task, model, method, split)` via
-  `python -m plm_benchmark.cli compare`.
-- `outputs/<model>/<task>/<split>/<method>/seed_<n>/` — Trainer cache + `finetuned_weights.pth`.
+- `outputs/experiments.csv` — one row per run. Key columns: `start_datetime`, `end_datetime`,
+  `duration_sec`, `task`, **`model`**, **`tokenizer`**, `method`, `split`, `metric`,
+  `test_score`, `val_score`, `epochs`, `lr`, `batch`, `seed`, `full_name` (original
+  registry/slug name), `scratch_dim/layers/heads` (scratch runs only), `git_commit`,
+  `checkpoint_policy`, `checkpoint`, `run_dir`. `model`/`tokenizer` are split from the raw
+  name: e.g. `ESM2_35M` + `PUMA_blosum62_07_005_12800_all`; hub ESM2 → tokenizer `AA`;
+  scratch → `scratch_d<dim>_l<layers>_h<heads>` + the `--tokenizer` label.
+- `outputs/comparison.csv` — aggregated mean/std per `(task, model, tokenizer, method, split)`
+  via `python -m plm_benchmark.cli compare`.
+- `outputs/<model>/<tokenizer>/<task>/<split>/<method>/seed_<n>/` — Trainer cache +
+  `finetuned_weights.pth`. Keyed on `(model, tokenizer)` so scratch capacity variants don't
+  collide.
+- `outputs/archives/` — pre-unified-pipeline CSVs (old schema, not comparable).
 
 ## Parallel execution on one GPU
 
@@ -217,7 +228,7 @@ python -m plm_benchmark.run_benchmark \
     --wandb_project pulm_ft --wandb_group sweep1
 
 # scratch baselines are controllable from the launcher too:
-python -m plm_benchmark.run_benchmark --models scratch --tokenizer esm2 \
+python -m plm_benchmark.run_benchmark --models scratch --tokenizer aa \
     --task peta_all --scratch-layers 2 --scratch-heads 8 --gpu 1 --jobs 8
 ```
 

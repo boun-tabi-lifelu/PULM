@@ -17,10 +17,12 @@ except ImportError:  # pragma: no cover - non-POSIX
 from plm_benchmark.config import CHECKPOINT_POLICY, COMPARE_CSV, LOG_CSV
 
 EXPERIMENT_FIELDS = [
-    "timestamp",
+    "start_datetime",
+    "end_datetime",
+    "duration_sec",
     "task",
     "model",
-    "checkpoint",
+    "tokenizer",
     "method",
     "split",
     "metric",
@@ -30,7 +32,13 @@ EXPERIMENT_FIELDS = [
     "lr",
     "batch",
     "seed",
+    "full_name",
+    "scratch_dim",
+    "scratch_layers",
+    "scratch_heads",
+    "git_commit",
     "checkpoint_policy",
+    "checkpoint",
     "run_dir",
     "error",
 ]
@@ -66,10 +74,13 @@ def load_experiments(path: Path = LOG_CSV, *, keep_all: bool = False) -> pd.Data
         return df
     ok = df["test_score"].notna() & (df["test_score"].astype(str) != "")
     df = df[ok]
+    sort_col = next((c for c in ("end_datetime", "start_datetime", "timestamp") if c in df.columns), None)
+    if sort_col:
+        df = df.sort_values(sort_col)
     if keep_all:
-        return df.sort_values("timestamp")
-    subset = [c for c in ["task", "model", "method", "split", "seed"] if c in df.columns]
-    return df.sort_values("timestamp").drop_duplicates(subset=subset, keep="last")
+        return df
+    subset = [c for c in ["task", "model", "tokenizer", "method", "split", "seed"] if c in df.columns]
+    return df.drop_duplicates(subset=subset, keep="last")
 
 
 def build_comparison(log_path: Path = LOG_CSV, out_path: Path = COMPARE_CSV) -> pd.DataFrame:
@@ -86,7 +97,7 @@ def build_comparison(log_path: Path = LOG_CSV, out_path: Path = COMPARE_CSV) -> 
     df["test_score"] = pd.to_numeric(df["test_score"], errors="coerce")
     df["val_score"] = pd.to_numeric(df["val_score"], errors="coerce")
 
-    group_cols = [c for c in ["task", "model", "method", "split"] if c in df.columns]
+    group_cols = [c for c in ["task", "model", "tokenizer", "method", "split"] if c in df.columns]
     rows = []
     for keys, sub in df.groupby(group_cols, sort=True):
         record = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))

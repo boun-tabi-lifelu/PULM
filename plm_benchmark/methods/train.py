@@ -13,9 +13,10 @@ import inspect
 import math
 import os
 import random
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import partial
+from functools import lru_cache, partial
 
 import numpy as np
 import torch
@@ -33,6 +34,7 @@ from plm_benchmark.config import (
     MAX_EPOCHS,
     MAX_SEQ_LENGTH,
     OUTPUTS_DIR,
+    ROOT,
     WEIGHT_DECAY,
 )
 from plm_benchmark.methods.data import collate_ppi, collate_single, ppi_dataset, single_dataset
@@ -44,6 +46,40 @@ from plm_benchmark.tasks import TaskSpec, preprocess_ppi_splits, preprocess_sequ
 from plm_benchmark.tokenizers import resolve_tokenizer
 
 METHODS = {"full_ft", "full_ft_peta20", "lora", "embed_head"}
+
+
+@lru_cache(maxsize=1)
+def _git_commit() -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=str(ROOT), stderr=subprocess.DEVNULL
+        )
+        return out.decode().strip()
+    except Exception:
+        return ""
+
+
+def _model_identity(model_cfg, scratch_dim: int, scratch_layers: int, scratch_heads: int) -> tuple[str, str]:
+    """(model, tokenizer) for logging/grouping. full_name stays = model_cfg.name.
+
+    - hub ESM2  -> (ESM2_<SIZE>, AA)
+    - scratch   -> (scratch_d<dim>_l<layers>_h<heads>, <tokenizer-label>)
+    - PULM/local-> parse the run slug 'ESM2_<SIZE>_<TOK...>' -> (ESM2_<SIZE>, <TOK...>)
+    """
+    if model_cfg.backend == "scratch":
+        model = f"scratch_d{scratch_dim}_l{scratch_layers}_h{scratch_heads}"
+        label = model_cfg.name[len("scratch_"):] if model_cfg.name.startswith("scratch_") else model_cfg.name
+        return model, (label or "unknown")
+    if model_cfg.source == "hub":
+        return model_cfg.name.upper(), "AA"
+
+    # PULM/local: pick the run-slug component (starts with ESM2), dropping 'final'.
+    parts = [p for p in model_cfg.name.split("__") if p and p != "final"]
+    slug = next((p for p in reversed(parts) if p.upper().startswith("ESM2")), parts[-1] if parts else model_cfg.name)
+    seg = slug.split("_")
+    if len(seg) >= 2 and seg[0].upper() == "ESM2":
+        return f"{seg[0]}_{seg[1]}", ("_".join(seg[2:]) or "AA")
+    return slug, "AA"
 
 
 @dataclass
@@ -213,15 +249,19 @@ def run_downstream(
     if method == "lora" and model_cfg.backend == "scratch":
         raise ValueError("lora is not applicable to the scratch baseline (no attention modules).")
 
+    start_dt = datetime.now(timezone.utc)
+
     freeze = method == "embed_head"
     use_lora = method == "lora"
     is_ppi = spec.task_type == "ppi"
+    is_scratch = model_cfg.backend == "scratch"
 
     epochs = _resolve_epochs(method, epochs)
     lr = _resolve_lr(model_cfg, method, lr)
     weight_decay = WEIGHT_DECAY
     stop_patience = EARLY_STOPPING_PATIENCE if patience is None else patience
     metric_for_best = f"eval_{spec.metric}"
+    model_name, tokenizer_name = _model_identity(model_cfg, scratch_dim, scratch_layers, scratch_heads)
 
     set_gpu(gpu)
     _set_seeds(seed)
@@ -236,7 +276,8 @@ def run_downstream(
         train_ds, valid_ds = single_dataset(train_df, spec), single_dataset(valid_df, spec)
 
     split_tag = split or "default"
-    run_dir = OUTPUTS_DIR / model_cfg.name / spec.name.lower() / split_tag / method / f"seed_{seed}"
+    # Keyed on (model, tokenizer) so scratch variants (dim/layers/heads) never collide.
+    run_dir = OUTPUTS_DIR / model_name / tokenizer_name / spec.name.lower() / split_tag / method / f"seed_{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     default_run_name = f"{model_cfg.name}/{spec.name}/{split_tag}/{method}/seed{seed}"
@@ -245,7 +286,7 @@ def run_downstream(
     mode = "frozen-encoder" if freeze else ("lora" if use_lora else "full")
     print(
         f"\n=== {spec.name} | {method} ({mode}) | split={split_tag} | seed={seed} "
-        f"| {model_cfg.name} [{model_cfg.backend}] ===",
+        f"| model={model_name} tokenizer={tokenizer_name} [{model_cfg.backend}] ===",
         flush=True,
     )
     print(
@@ -347,11 +388,14 @@ def run_downstream(
         trainer.log({f"test/{spec.metric}": test})
     _finish_wandb(report_to)
 
+    end_dt = datetime.now(timezone.utc)
     row = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "start_datetime": start_dt.isoformat(),
+        "end_datetime": end_dt.isoformat(),
+        "duration_sec": round((end_dt - start_dt).total_seconds(), 1),
         "task": spec.name,
-        "model": model_cfg.name,
-        "checkpoint": model_cfg.checkpoint,
+        "model": model_name,
+        "tokenizer": tokenizer_name,
         "method": method,
         "split": split_tag,
         "metric": spec.metric,
@@ -361,7 +405,13 @@ def run_downstream(
         "lr": lr,
         "batch": batch,
         "seed": seed,
+        "full_name": model_cfg.name,
+        "scratch_dim": scratch_dim if is_scratch else "",
+        "scratch_layers": scratch_layers if is_scratch else "",
+        "scratch_heads": scratch_heads if is_scratch else "",
+        "git_commit": _git_commit(),
         "checkpoint_policy": CHECKPOINT_POLICY,
+        "checkpoint": model_cfg.checkpoint,
         "run_dir": str(run_dir.relative_to(OUTPUTS_DIR.parent)),
     }
     append_experiment(row)

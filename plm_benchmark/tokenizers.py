@@ -2,7 +2,8 @@
 
 A ``--tokenizer`` spec may be:
 
-* ``esm2``                     -> the ESM-2 tokenizer (identical across all sizes)
+* ``aa``                       -> the amino-acid (ESM-2) tokenizer, identical across
+                                  all ESM-2 sizes (``esm2`` is accepted as an alias)
 * ``/path/to/tokenizer.json``  -> a raw ``tokenizers`` JSON (PUMA/BPE), wrapped
                                   with ESM-2 special tokens + <cls>..<eos> template
 * ``/path/to/dir`` or hub id   -> ``AutoTokenizer.from_pretrained``
@@ -26,8 +27,8 @@ def tokenizer_label(spec: str | None) -> str:
     """Short, path-safe label used to name scratch runs. No heavy imports."""
     if not spec:
         return "notok"
-    if spec.lower() == "esm2":
-        return "esm2"
+    if spec.lower() in ("aa", "esm2"):
+        return "AA"  # uppercase to match hub/PULM AA-tokenizer naming
     p = Path(spec)
     if p.suffix == ".json":
         stem = p.stem
@@ -42,7 +43,7 @@ def resolve_tokenizer(spec: str | None, *, max_length: int = 1024):
         return None
     from transformers import AutoTokenizer
 
-    if spec.lower() == "esm2":
+    if spec.lower() in ("aa", "esm2"):
         return AutoTokenizer.from_pretrained(REFERENCE_TOKENIZER)
     p = Path(spec)
     if p.is_dir():

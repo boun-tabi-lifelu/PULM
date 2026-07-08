@@ -14,7 +14,7 @@ Examples:
 
     # Scratch tokenizer baseline, 2-layer contextual variant
     python -m plm_benchmark.run_benchmark \
-        --models scratch --tokenizer esm2 --task peta_all \
+        --models scratch --tokenizer aa --task peta_all \
         --scratch-layers 2 --scratch-heads 8 --gpu 1 --jobs 8
 
 Per-job stdout/stderr goes to outputs/logs/<job>.log; the console shows a
