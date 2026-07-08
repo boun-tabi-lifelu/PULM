@@ -323,7 +323,6 @@ dependencies:
       - responses==0.18.0
       - safetensors==0.4.2
       - tokenizers==0.13.2
-      - torchmetrics==1.2.1
       - tqdm==4.64.1
       - transformers==4.26.1
       - wandb==0.16.6

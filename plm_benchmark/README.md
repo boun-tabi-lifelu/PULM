@@ -33,8 +33,8 @@ python -m plm_benchmark.cli list-tasks
   deeploc_signal), remote homology, and PPI (yeast, shs27k, sun).
 
 Metrics follow each source: Spearman (regression fitness), MSE (eSol), accuracy
-(single-label classification / PPI), and multilabel accuracy via `torchmetrics`
-(`Accuracy(task="multilabel")`) for the DeepLoc tasks — matching PETA exactly.
+(single-label classification / PPI), and per-label multilabel accuracy for the DeepLoc
+tasks — identical to PETA's `torchmetrics Accuracy(task="multilabel")` (computed in NumPy).
 
 Task groups for `--task`: `all` (Rost only), `peta_all`, `everything`, or a comma-separated
 list. PETA datasets with multiple partitions take `--split-method` (e.g. `one_vs_rest`).
@@ -235,7 +235,7 @@ go to `outputs/logs/`; `experiments.csv` is append-locked so parallel writes are
 python -m plm_benchmark.run_benchmark \
     --models esm2_8m,esm2_35m --task peta_all --seeds 42,43,44 \
     --method full_ft --gpu 1 --jobs 8 --eval-every 5 --val-batch 64 \
-    --wandb_project pulm_ft --wandb_group sweep1
+    --wandb_project pulm-ft --wandb_group sweep1
 
 # scratch baselines are controllable from the launcher too:
 python -m plm_benchmark.run_benchmark --models scratch --tokenizer aa \

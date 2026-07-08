@@ -10,7 +10,7 @@ Examples:
     # Sweep two PLMs over all PETA tasks
     python -m plm_benchmark.run_benchmark \
         --models esm2_8m,esm2_35m --task peta_all --seeds 42,43,44 \
-        --method full_ft --gpu 1 --jobs 8 --eval-every 5 --wandb_project pulm_ft
+        --method full_ft --gpu 1 --jobs 8 --eval-every 5 --wandb_project pulm-ft
 
     # Scratch tokenizer baseline, 2-layer contextual variant
     python -m plm_benchmark.run_benchmark \
