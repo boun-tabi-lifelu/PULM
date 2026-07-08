@@ -46,6 +46,7 @@ from plm_benchmark.tasks import TaskSpec, preprocess_ppi_splits, preprocess_sequ
 from plm_benchmark.tokenizers import resolve_tokenizer
 
 METHODS = {"full_ft", "full_ft_peta20", "lora", "embed_head"}
+DT_FMT = "%Y-%m-%d %H:%M:%S"  # experiments.csv datetimes: date + hh:mm:ss (UTC), no ms/offset
 
 
 @lru_cache(maxsize=1)
@@ -149,7 +150,12 @@ def _resolve_lr(model_cfg, method: str, lr: float | None) -> float:
     return LR_FULL_FT  # full_ft / full_ft_peta20 on a pretrained encoder
 
 
-def _setup_wandb(cfg: WandbConfig | None, default_run_name: str, resume_from_checkpoint) -> tuple[list[str], str | None]:
+def _setup_wandb(
+    cfg: WandbConfig | None,
+    default_run_name: str,
+    default_group: str,
+    resume_from_checkpoint,
+) -> tuple[list[str], str | None]:
     """Wire env vars for a single run. Returns (report_to, run_name)."""
     if cfg is None or not cfg.project:
         return ["none"], None
@@ -158,8 +164,7 @@ def _setup_wandb(cfg: WandbConfig | None, default_run_name: str, resume_from_che
     os.environ["WANDB_MODE"] = cfg.mode
     if cfg.entity:
         os.environ["WANDB_ENTITY"] = cfg.entity
-    if cfg.group:
-        os.environ["WANDB_RUN_GROUP"] = cfg.group
+    os.environ["WANDB_RUN_GROUP"] = cfg.group or default_group
 
     # Continue THE SAME run only when an id is given (resume/merge). Otherwise a
     # fresh run per (task, seed) — clear any stale id so the loop never collides.
@@ -280,8 +285,9 @@ def run_downstream(
     run_dir = OUTPUTS_DIR / model_name / tokenizer_name / spec.name.lower() / split_tag / method / f"seed_{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    default_run_name = f"{model_cfg.name}/{spec.name}/{split_tag}/{method}/seed{seed}"
-    report_to, run_name = _setup_wandb(wandb_cfg, default_run_name, resume_from_checkpoint)
+    default_run_name = f"{model_name}/{tokenizer_name}/{spec.name}/{split_tag}/{method}/seed{seed}"
+    default_group = f"{model_name}/{tokenizer_name}"
+    report_to, run_name = _setup_wandb(wandb_cfg, default_run_name, default_group, resume_from_checkpoint)
 
     mode = "frozen-encoder" if freeze else ("lora" if use_lora else "full")
     print(
@@ -390,8 +396,8 @@ def run_downstream(
 
     end_dt = datetime.now(timezone.utc)
     row = {
-        "start_datetime": start_dt.isoformat(),
-        "end_datetime": end_dt.isoformat(),
+        "start_datetime": start_dt.strftime(DT_FMT),
+        "end_datetime": end_dt.strftime(DT_FMT),
         "duration_sec": round((end_dt - start_dt).total_seconds(), 1),
         "task": spec.name,
         "model": model_name,

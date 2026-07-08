@@ -22,6 +22,37 @@ ESM2_SPECIALS = {
     "mask_token": "<mask>",
 }
 
+# Tokenizers live under a uniref50_<date> folder -> models trained on "all".
+# This matches the training-data suffix in the PLM run slugs (ESM2_35M_..._all),
+# so a scratch run and the PLM using the same tokenizer share one tokenizer label.
+TRAINING_DATA_SUFFIX = "all"
+
+
+def _nodot(v: str) -> str:
+    return str(v).replace(".", "")  # 0.7 -> 07, 0.05 -> 005 (matches plm_train)
+
+
+def _json_tokenizer_label(path: Path) -> str:
+    """Convert a PUMA/BPE tokenizer JSON path to the PLM run-slug tokenizer label.
+
+    Mirrors plm_train.build_run_slug's tokenizer part (uniref50 is static -> omitted):
+      .../blosum62/hf_uniref50_mutbpe_0.7_3_12_0.05_12800.json -> PUMA_blosum62_07_005_12800_all
+      .../bpe/hf_uniref50_bpe_12800.json                       -> BPE_12800_all
+    """
+    subfolder = path.parent.name  # 'bpe' or the PUMA substitution matrix (e.g. blosum62)
+    stem = path.stem[3:] if path.stem.startswith("hf_") else path.stem
+    parts = stem.split("_")
+    vocab = parts[-1]
+    if subfolder.lower() == "bpe":
+        core = f"BPE_{vocab}"
+    else:
+        # PUMA: cutoff and min-mutation-freq are the two floats; min/max length ignored.
+        floats = [p for p in parts if "." in p]
+        cutoff = _nodot(floats[0]) if len(floats) >= 1 else "NA"
+        minfreq = _nodot(floats[1]) if len(floats) >= 2 else "NA"
+        core = f"PUMA_{subfolder}_{cutoff}_{minfreq}_{vocab}"
+    return f"{core}_{TRAINING_DATA_SUFFIX}"
+
 
 def tokenizer_label(spec: str | None) -> str:
     """Short, path-safe label used to name scratch runs. No heavy imports."""
@@ -31,8 +62,7 @@ def tokenizer_label(spec: str | None) -> str:
         return "AA"  # uppercase to match hub/PULM AA-tokenizer naming
     p = Path(spec)
     if p.suffix == ".json":
-        stem = p.stem
-        return stem[3:] if stem.startswith("hf_") else stem
+        return _json_tokenizer_label(p)
     if p.exists():
         return p.name
     return spec.rstrip("/").split("/")[-1]

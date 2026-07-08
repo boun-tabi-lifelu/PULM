@@ -96,9 +96,16 @@ python -m plm_benchmark.cli train --task peta_gb1 --method full_ft \
 
 `--tokenizer` accepts: `aa` (amino-acid/ESM-2 tokenizer; `esm2` is an accepted alias), a
 `tokenizer.json` path, a saved-tokenizer directory, or a Hub id. `--scratch-dim` sets the
-embedding/hidden size (default 320, matching ESM2-8M). The run is named
-`scratch_<tokenizer-label>` (so `--tokenizer aa` → `scratch_AA`, matching the `AA` tokenizer
-label used for hub/PULM amino-acid models).
+embedding/hidden size (default 320, matching ESM2-8M).
+
+The `tokenizer` label matches the PLM run-slug convention so a scratch run and the PLM using
+the same tokenizer share one label (`uniref50` is static → omitted; `_all` = trained on all):
+
+| `--tokenizer` | tokenizer label / run name |
+|---|---|
+| `aa` | `AA` → `scratch_AA` |
+| `.../blosum62/hf_uniref50_mutbpe_0.7_3_12_0.05_12800.json` | `PUMA_blosum62_07_005_12800_all` |
+| `.../bpe/hf_uniref50_bpe_12800.json` | `BPE_12800_all` |
 
 #### Baseline capacity: `--scratch-layers` / `--scratch-heads`
 
@@ -132,15 +139,18 @@ python -m plm_benchmark.cli train --task peta_gb1 --method full_ft --model scrat
 ## Weights & Biases
 
 Pass `--wandb_project` to log train/eval loss and task metrics per run; the test score is
-logged at the end. Each `(task, seed, split)` becomes its own run.
+logged at the end. Each `(task, seed, split)` becomes its own run, named
+`{model}/{tokenizer}/{task}/{split}/{method}/seed{n}`, and runs are **grouped by
+`{model}/{tokenizer}`** automatically (override with `--wandb_group`).
 
 ```bash
 python -m plm_benchmark.cli train --task GB1 --method full_ft --model esm2_8m \
-    --wandb_project pulm --wandb_group esm2_8m
+    --wandb_project pulm
 ```
 
-Also: `--wandb_run_name`, `--wandb_entity`, `--wandb_mode {online,offline,disabled}`, and
-`--wandb_run_id`/`--wandb_resume` together with `--resume-from-checkpoint` to continue a run.
+Also: `--wandb_run_name`, `--wandb_group`, `--wandb_entity`,
+`--wandb_mode {online,offline,disabled}`, and `--wandb_run_id`/`--wandb_resume` together with
+`--resume-from-checkpoint` to continue a run.
 
 ## Data layout
 

@@ -82,7 +82,7 @@ def cmd_train(args: argparse.Namespace) -> None:
                 )
             except Exception as e:
                 print(f"FAILED {name} seed={seed}: {e}")
-                now = datetime.now(timezone.utc).isoformat()
+                now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 append_experiment(
                     {
                         "start_datetime": now,
@@ -243,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--wandb_project", default=None, help="Enables wandb when set.")
     t.add_argument("--wandb_run_name", default=None)
     t.add_argument("--wandb_entity", default=None)
-    t.add_argument("--wandb_group", default=None, help="Group runs (e.g. by model size).")
+    t.add_argument("--wandb_group", default=None, help="Group runs (default: {model}/{tokenizer}).")
     t.add_argument("--wandb_mode", default="online", choices=["online", "offline", "disabled"])
     t.add_argument(
         "--wandb_run_id",

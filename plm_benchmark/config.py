@@ -124,7 +124,7 @@ def resolve_model(
     models = get_models()
 
     # scratch: randomly-initialised baseline. The tokenizer is supplied separately
-    # (--tokenizer) and names the run, e.g. scratch_aa / scratch_<json-stem>.
+    # (--tokenizer) and names the run, e.g. scratch_AA / scratch_PUMA_blosum62_07_005_12800_all.
     if name == "scratch":
         from plm_benchmark.tokenizers import tokenizer_label
 
