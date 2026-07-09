@@ -78,6 +78,10 @@ python -m plm_benchmark.cli list-models
 
 - Hub ESM-2 (`esm2_8m`, `esm2_35m`, `esm2_150m`) and auto-discovered PULM checkpoints.
 - `--checkpoint <dir>` points at a local checkpoint; its own tokenizer is used.
+- **PUMA parent-collapsed (`_PC`) checkpoints** are handled automatically: if a checkpoint
+  contains `full_tokenizer/` + `collapse.npy`, tokenization is done with the full PUMA vocab
+  and remapped child→parent to the model's reduced ids (matching how it was pretrained). No
+  flag needed; any `--tokenizer` override is ignored for these.
 
 ### From-scratch tokenizer baseline
 

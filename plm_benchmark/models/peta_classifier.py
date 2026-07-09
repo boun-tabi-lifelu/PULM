@@ -107,11 +107,25 @@ def build_model(
             pad_token_id=tokenizer.pad_token_id,
         )
     else:
-        if tokenizer is None:
+        from plm_benchmark.models.collapse import CollapseTokenizer, is_collapse_checkpoint
+
+        if is_collapse_checkpoint(model_cfg.checkpoint):
+            # PUMA parent-collapsed checkpoint: must tokenize-with-full then remap.
+            if tokenizer is not None:
+                print(
+                    "WARNING: --tokenizer ignored for parent-collapsed checkpoint; "
+                    "using its full_tokenizer/ + collapse.npy.",
+                    flush=True,
+                )
+            tokenizer = CollapseTokenizer(model_cfg.checkpoint)
+        elif tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(model_cfg.checkpoint)
+
         model_type = AutoConfig.from_pretrained(model_cfg.checkpoint).model_type
         enc_kwargs: dict = {"add_pooling_layer": False} if model_type == "esm" else {}
         encoder = AutoModel.from_pretrained(model_cfg.checkpoint, **enc_kwargs)
+        if isinstance(tokenizer, CollapseTokenizer):
+            tokenizer.validate(encoder.config.vocab_size)
         if use_lora:
             from peft import LoraConfig, inject_adapter_in_model
 
