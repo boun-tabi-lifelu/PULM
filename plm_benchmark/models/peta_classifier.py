@@ -117,7 +117,7 @@ def build_model(
                     "using its full_tokenizer/ + collapse.npy.",
                     flush=True,
                 )
-            tokenizer = CollapseTokenizer(model_cfg.checkpoint)
+            tokenizer = CollapseTokenizer.from_checkpoint(model_cfg.checkpoint)
         elif tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(model_cfg.checkpoint)
 

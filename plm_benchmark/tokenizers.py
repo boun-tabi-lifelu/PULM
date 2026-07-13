@@ -32,18 +32,21 @@ def _nodot(v: str) -> str:
     return str(v).replace(".", "")  # 0.7 -> 07, 0.05 -> 005 (matches plm_train)
 
 
-def _json_tokenizer_label(path: Path) -> str:
+def _json_tokenizer_label(path: Path, parent_collapse: bool = False) -> str:
     """Convert a PUMA/BPE tokenizer JSON path to the PLM run-slug tokenizer label.
 
-    Mirrors plm_train.build_run_slug's tokenizer part (uniref50 is static -> omitted):
+    Mirrors plm_train.build_run_slug's tokenizer part (uniref50 is static -> omitted;
+    '_PC' before the training-data suffix for parent-collapsed PUMA):
       .../blosum62/hf_uniref50_mutbpe_0.7_3_12_0.05_12800.json -> PUMA_blosum62_07_005_12800_all
+      (same, with --parent-collapse)                           -> PUMA_blosum62_07_005_12800_PC_all
       .../bpe/hf_uniref50_bpe_12800.json                       -> BPE_12800_all
     """
     subfolder = path.parent.name  # 'bpe' or the PUMA substitution matrix (e.g. blosum62)
     stem = path.stem[3:] if path.stem.startswith("hf_") else path.stem
     parts = stem.split("_")
     vocab = parts[-1]
-    if subfolder.lower() == "bpe":
+    is_bpe = subfolder.lower() == "bpe"
+    if is_bpe:
         core = f"BPE_{vocab}"
     else:
         # PUMA: cutoff and min-mutation-freq are the two floats; min/max length ignored.
@@ -51,10 +54,11 @@ def _json_tokenizer_label(path: Path) -> str:
         cutoff = _nodot(floats[0]) if len(floats) >= 1 else "NA"
         minfreq = _nodot(floats[1]) if len(floats) >= 2 else "NA"
         core = f"PUMA_{subfolder}_{cutoff}_{minfreq}_{vocab}"
-    return f"{core}_{TRAINING_DATA_SUFFIX}"
+    suffix = f"PC_{TRAINING_DATA_SUFFIX}" if (parent_collapse and not is_bpe) else TRAINING_DATA_SUFFIX
+    return f"{core}_{suffix}"
 
 
-def tokenizer_label(spec: str | None) -> str:
+def tokenizer_label(spec: str | None, parent_collapse: bool = False) -> str:
     """Short, path-safe label used to name scratch runs. No heavy imports."""
     if not spec:
         return "notok"
@@ -62,7 +66,7 @@ def tokenizer_label(spec: str | None) -> str:
         return "AA"  # uppercase to match hub/PULM AA-tokenizer naming
     p = Path(spec)
     if p.suffix == ".json":
-        return _json_tokenizer_label(p)
+        return _json_tokenizer_label(p, parent_collapse)
     if p.exists():
         return p.name
     return spec.rstrip("/").split("/")[-1]

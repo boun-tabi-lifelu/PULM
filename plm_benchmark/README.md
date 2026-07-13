@@ -111,6 +111,22 @@ the same tokenizer share one label (`uniref50` is static → omitted; `_all` = t
 | `.../blosum62/hf_uniref50_mutbpe_0.7_3_12_0.05_12800.json` | `PUMA_blosum62_07_005_12800_all` |
 | `.../bpe/hf_uniref50_bpe_12800.json` | `BPE_12800_all` |
 
+#### PUMA parent-collapse: `--parent-collapse`
+
+For a scratch run over a **PUMA** tokenizer, `--parent-collapse` folds each child token onto
+its mutational parent — the model then trains on the *reduced* vocab (parents + singletons +
+specials), exactly like `plm_train`'s collapse-to-parent pretraining. Segmentation is done
+with the full PUMA vocab and the ids are remapped child→parent automatically. It requires the
+PUMA **family JSON** next to the tokenizer (the non-`hf_` sibling of the `.json`, same dir).
+Scratch + PUMA only (BPE/AA are rejected; pretrained `_PC` checkpoints are auto-detected). The
+tokenizer label gains a `_PC` marker (e.g. `PUMA_blosum62_07_005_12800_PC_all`), so collapsed
+and uncollapsed scratch runs are distinct in `experiments.csv` and `outputs/`.
+
+```bash
+python -m plm_benchmark.cli train --task peta_gb1 --method full_ft --model scratch \
+    --tokenizer /path/to/blosum62/hf_uniref50_mutbpe_0.7_3_12_0.05_12800.json --parent-collapse
+```
+
 #### Baseline capacity: `--scratch-layers` / `--scratch-heads`
 
 The scratch encoder's strength is a dial. The shared attention1d pooling + linear head is

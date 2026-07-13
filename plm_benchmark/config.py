@@ -120,16 +120,18 @@ def resolve_model(
     name: str | None = None,
     checkpoint: str | None = None,
     tokenizer: str | None = None,
+    parent_collapse: bool = False,
 ) -> ModelConfig:
     models = get_models()
 
     # scratch: randomly-initialised baseline. The tokenizer is supplied separately
-    # (--tokenizer) and names the run, e.g. scratch_AA / scratch_PUMA_blosum62_07_005_12800_all.
+    # (--tokenizer) and names the run, e.g. scratch_AA / scratch_PUMA_..._all
+    # (or scratch_PUMA_..._PC_all with --parent-collapse).
     if name == "scratch":
         from plm_benchmark.tokenizers import tokenizer_label
 
         return ModelConfig(
-            name=f"scratch_{tokenizer_label(tokenizer)}",
+            name=f"scratch_{tokenizer_label(tokenizer, parent_collapse)}",
             checkpoint=checkpoint or "",
             backend="scratch",
             source="scratch",

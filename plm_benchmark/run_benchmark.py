@@ -74,6 +74,8 @@ def job_cmd(job: dict, args) -> list[str]:
     ]
     if args.tokenizer:
         cmd += ["--tokenizer", args.tokenizer]
+    if args.parent_collapse:
+        cmd += ["--parent-collapse"]
     if args.split_method:
         cmd += ["--split-method", args.split_method]
     if args.epochs:
@@ -120,6 +122,11 @@ def main() -> None:
     p.add_argument("--val-batch", type=int, default=64)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--tokenizer", default=None, help="For --models scratch.")
+    p.add_argument(
+        "--parent-collapse",
+        action="store_true",
+        help="Scratch + PUMA: fold children onto mutational parents (reduced vocab).",
+    )
     p.add_argument("--scratch-dim", type=int, default=320, help="Scratch embedding/hidden dim.")
     p.add_argument(
         "--scratch-layers",

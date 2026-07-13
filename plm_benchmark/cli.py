@@ -42,7 +42,14 @@ def _wandb_cfg(args: argparse.Namespace) -> WandbConfig:
 
 
 def cmd_train(args: argparse.Namespace) -> None:
-    model_cfg = resolve_model(args.model, args.checkpoint, tokenizer=args.tokenizer)
+    model_cfg = resolve_model(
+        args.model, args.checkpoint, tokenizer=args.tokenizer, parent_collapse=args.parent_collapse
+    )
+    if args.parent_collapse and model_cfg.backend != "scratch":
+        raise SystemExit(
+            "--parent-collapse only applies to --model scratch. Pretrained parent-collapsed "
+            "(_PC) checkpoints are detected and handled automatically."
+        )
     tasks = resolve_tasks(args.task)
     seeds = _parse_seeds(args)
     wandb_cfg = _wandb_cfg(args)
@@ -70,6 +77,7 @@ def cmd_train(args: argparse.Namespace) -> None:
                     eval_every=args.eval_every,
                     patience=args.patience,
                     tokenizer_spec=args.tokenizer,
+                    parent_collapse=args.parent_collapse,
                     scratch_dim=args.scratch_dim,
                     scratch_layers=args.scratch_layers,
                     scratch_heads=args.scratch_heads,
@@ -198,6 +206,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Tokenizer for --model scratch (required): 'aa' (amino-acid/ESM-2 tokenizer), "
         "a tokenizer.json path, a saved-tokenizer dir, or a hub id. Optional override for other models.",
+    )
+    t.add_argument(
+        "--parent-collapse",
+        action="store_true",
+        help="Scratch + PUMA only: fold children onto mutational parents (reduced vocab), "
+        "tokenizing with the full vocab and remapping. Needs the family JSON sibling of the "
+        "tokenizer .json (same dir, 'hf_'-stripped name). Mirrors plm_train's collapse.",
     )
     t.add_argument("--gpu", type=int, default=1, help="GPU id (1 = first device)")
     t.add_argument("--epochs", type=int, default=None, help=f"Override max epochs (default {MAX_EPOCHS} for all tasks)")

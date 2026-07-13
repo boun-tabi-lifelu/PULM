@@ -239,6 +239,7 @@ def run_downstream(
     eval_every: int = 1,
     patience: int | None = None,
     tokenizer_spec: str | None = None,
+    parent_collapse: bool = False,
     scratch_dim: int = 320,
     scratch_layers: int = 0,
     scratch_heads: int = 8,
@@ -301,7 +302,14 @@ def run_downstream(
         flush=True,
     )
 
-    tokenizer_obj = resolve_tokenizer(tokenizer_spec, max_length=max_length) if tokenizer_spec else None
+    if parent_collapse:
+        from plm_benchmark.models.collapse import build_collapse_tokenizer_from_spec
+
+        tokenizer_obj = build_collapse_tokenizer_from_spec(tokenizer_spec, max_length)
+    elif tokenizer_spec:
+        tokenizer_obj = resolve_tokenizer(tokenizer_spec, max_length=max_length)
+    else:
+        tokenizer_obj = None
     model, tokenizer = build_model(
         model_cfg,
         spec,
