@@ -73,6 +73,59 @@ def resolve_tasks(task_arg: str) -> list[str]:
     return names
 
 
+ALL_SPLITS = "all"  # --split-method sentinel: run every curated split of the task(s)
+
+
+def run_splits_for(name: str) -> list[str | None]:
+    """Curated splits to enumerate for a task (default first). Single-split tasks -> [split]."""
+    from plm_benchmark.peta_data import PETA_RUN_SPLITS
+
+    spec = TASKS[name]
+    if spec.peta_key and spec.peta_key in PETA_RUN_SPLITS:
+        return list(PETA_RUN_SPLITS[spec.peta_key])
+    return [spec.default_split]  # may be None (Rost / single-split PETA)
+
+
+def _validate_split(name: str, split: str) -> None:
+    from plm_benchmark.peta_data import PETA_SPLIT_OPTIONS
+
+    spec = TASKS[name]
+    if spec.peta_key and spec.peta_key in PETA_SPLIT_OPTIONS:
+        options = PETA_SPLIT_OPTIONS[spec.peta_key]
+        if split not in options:
+            raise ValueError(f"Unknown split {split!r} for {name}. Options: {options}")
+
+
+def resolve_task_splits(task_arg: str, split_method: str | None = None) -> list[tuple[str, str | None]]:
+    """Expand a task selection into (task, split) pairs.
+
+    - group (all/peta_all/everything) -> every task x its curated run-splits (split_method ignored)
+    - --split-method all              -> named task(s) x their curated run-splits
+    - --split-method X                -> named task(s) at split X (validated)
+    - no --split-method               -> named task(s) at default split only (backward compatible)
+    """
+    is_group = task_arg.lower() in ("all", "peta_all", "everything")
+    names = resolve_tasks(task_arg)
+
+    if is_group and split_method and split_method != ALL_SPLITS:
+        print(f"WARNING: --split-method {split_method!r} ignored for group '{task_arg}'; "
+              "running each task's curated splits.", flush=True)
+
+    pairs: list[tuple[str, str | None]] = []
+    for name in names:
+        if is_group or split_method == ALL_SPLITS:
+            splits = run_splits_for(name)
+        elif split_method:
+            _validate_split(name, split_method)
+            splits = [split_method]
+        else:
+            splits = [TASKS[name].default_split]
+        for s in splits:
+            if (name, s) not in pairs:
+                pairs.append((name, s))
+    return pairs
+
+
 def preprocess_sequences(df: pd.DataFrame, *, task_type: str = "regression") -> pd.DataFrame:
     if task_type == "ppi":
         return df.copy()

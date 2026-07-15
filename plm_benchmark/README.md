@@ -37,7 +37,15 @@ Metrics follow each source: Spearman (regression fitness), MSE (eSol), accuracy
 tasks — identical to PETA's `torchmetrics Accuracy(task="multilabel")` (computed in NumPy).
 
 Task groups for `--task`: `all` (Rost only), `peta_all`, `everything`, or a comma-separated
-list. PETA datasets with multiple partitions take `--split-method` (e.g. `one_vs_rest`).
+list.
+
+**Splits.** Some FLIP/PETA datasets have multiple partitions (gb1, aav, meltome, deeploc_2,
+remote_homology). Each `(task, split)` is a separate run, logged with its own `split` value:
+- `everything` / `peta_all` → every task × **every curated split** (`list-tasks` shows the set).
+- `--task peta_gb1 --split-method all` → all curated splits of that task.
+- `--task peta_gb1 --split-method two_vs_rest` → that one split.
+- `--task peta_gb1` (no `--split-method`) → the **default** split only (backward-compatible;
+  task names are unchanged, so earlier default-split results stay valid).
 
 ## Training modes (`--method`)
 
@@ -245,29 +253,36 @@ Optionally cap per-client memory so one job can't starve the others:
 
 ### 3. Launch with bounded concurrency
 
-`plm_benchmark/run_benchmark.py` fans `(model × task × seed)` out over a thread pool of
-`--jobs` subprocesses, each a normal CLI `train` call. It lowers CPU threads
+`plm_benchmark/run_benchmark.py` fans `(model × tokenizer × task × split × seed)` out over a
+thread pool of `--jobs` subprocesses, each a normal CLI `train` call. It lowers CPU threads
 (`OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `TOKENIZERS_PARALLELISM=false`) and
 sets `--num-workers 0` per job so K processes don't thrash the CPU. Per-job logs
 go to `outputs/logs/`; `experiments.csv` is append-locked so parallel writes are safe.
 
 ```bash
+# every task × every curated split, two PLMs
 python -m plm_benchmark.run_benchmark \
-    --models esm2_8m,esm2_35m --task peta_all --seeds 42,43,44 \
+    --models esm2_8m,esm2_35m --task everything --seeds 42,43,44 \
     --method full_ft --gpu 1 --jobs 8 --eval-every 5 --val-batch 64 \
     --wandb_project pulm-ft --wandb_group sweep1
 
-# scratch baselines are controllable from the launcher too:
-python -m plm_benchmark.run_benchmark --models scratch --tokenizer aa \
-    --task peta_all --scratch-layers 2 --scratch-heads 8 --gpu 1 --jobs 8
+# scratch baseline sweeping MULTIPLE tokenizers (comma-separated; scratch only)
+python -m plm_benchmark.run_benchmark --models scratch \
+    --tokenizer aa,/path/puma.json,/path/bpe.json \
+    --task everything --scratch-layers 2 --gpu 1 --jobs 8
 ```
 
 Tuning knobs:
 - `--jobs` — concurrent processes (start at 8, watch `nvidia-smi`, raise until memory/CPU saturate).
+- `--tokenizer` — comma-separated list to sweep (scratch only; non-scratch ignore it).
+- `--split-method` — one split, `all`, or omit; groups always run every curated split.
 - `--num-workers` — keep at 0–1 when `--jobs` is high.
 - `--eval-every` — evaluate/checkpoint every N epochs (see below).
 - `--val-batch` — larger eval/test batches use the H100 better (default 64).
 - `--scratch-dim` / `--scratch-layers` / `--scratch-heads` — scratch-baseline capacity (see the scratch section).
+
+> Job count multiplies fast: `everything` (37 task×split) × models × tokenizers × seeds. Check
+> `len(jobs)` printed at launch before committing to a big grid.
 
 ### Faster long runs: `--eval-every` and `--val-batch`
 

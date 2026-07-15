@@ -6,16 +6,19 @@ CLI. A thread pool keeps --jobs of them in flight at once; the GPU is shared
 (time-sliced, or better via NVIDIA MPS — see the README). Results are written to
 outputs/experiments.csv, which is append-locked so concurrent writers are safe.
 
+`--task everything` runs every task x every curated split; use `--split-method all`
+for all splits of a named task, or `--split-method X` for one.
+
 Examples:
-    # Sweep two PLMs over all PETA tasks
+    # Sweep two PLMs over all PETA tasks and their splits
     python -m plm_benchmark.run_benchmark \
         --models esm2_8m,esm2_35m --task peta_all --seeds 42,43,44 \
         --method full_ft --gpu 1 --jobs 8 --eval-every 5 --wandb_project pulm-ft
 
-    # Scratch tokenizer baseline, 2-layer contextual variant
+    # Scratch baseline sweeping multiple tokenizers over everything
     python -m plm_benchmark.run_benchmark \
-        --models scratch --tokenizer aa --task peta_all \
-        --scratch-layers 2 --scratch-heads 8 --gpu 1 --jobs 8
+        --models scratch --tokenizer aa,/path/puma.json,/path/bpe.json \
+        --task everything --scratch-layers 2 --gpu 1 --jobs 8
 
 Per-job stdout/stderr goes to outputs/logs/<job>.log; the console shows a
 one-line PASS/FAIL summary per job.
@@ -36,23 +39,36 @@ ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = ROOT / "outputs" / "logs"
 
 
-def expand_tasks(task_arg: str) -> list[str]:
-    """Expand groups (all / peta_all / everything) into concrete task names."""
+def expand_task_splits(task_arg: str, split_method):
+    """Expand a task selection into (task, split) pairs (see cli.resolve_task_splits)."""
     sys.path.insert(0, str(ROOT))
-    from plm_benchmark.tasks import resolve_tasks
+    from plm_benchmark.tasks import resolve_task_splits
 
-    return resolve_tasks(task_arg)
+    return resolve_task_splits(task_arg, split_method)
+
+
+def _tok_label(spec):
+    sys.path.insert(0, str(ROOT))
+    from plm_benchmark.tokenizers import tokenizer_label
+
+    return tokenizer_label(spec) if spec else "def"
 
 
 def build_jobs(args) -> list[dict]:
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     seeds = [s.strip() for s in args.seeds.split(",") if s.strip()]
-    tasks = expand_tasks(args.task)
+    tokenizers = [t.strip() for t in (args.tokenizer or "").split(",") if t.strip()] or [None]
+    pairs = expand_task_splits(args.task, args.split_method)  # [(task, split)]
+
     jobs = []
     for model in models:
-        for task in tasks:
-            for seed in seeds:
-                jobs.append({"model": model, "task": task, "seed": seed})
+        toks = tokenizers if model == "scratch" else [None]  # tokenizer sweep only for scratch
+        for tok in toks:
+            for task, split in pairs:
+                for seed in seeds:
+                    jobs.append(
+                        {"model": model, "tokenizer": tok, "task": task, "split": split, "seed": seed}
+                    )
     return jobs
 
 
@@ -72,12 +88,12 @@ def job_cmd(job: dict, args) -> list[str]:
         "--scratch-layers", str(args.scratch_layers),
         "--scratch-heads", str(args.scratch_heads),
     ]
-    if args.tokenizer:
-        cmd += ["--tokenizer", args.tokenizer]
+    if job["tokenizer"]:
+        cmd += ["--tokenizer", job["tokenizer"]]
     if args.parent_collapse:
         cmd += ["--parent-collapse"]
-    if args.split_method:
-        cmd += ["--split-method", args.split_method]
+    if job["split"]:
+        cmd += ["--split-method", job["split"]]
     if args.epochs:
         cmd += ["--epochs", str(args.epochs)]
     if args.wandb_project:
@@ -99,7 +115,8 @@ def child_env() -> dict:
 
 
 def run_one(job: dict, args, env: dict) -> tuple[dict, int, float]:
-    tag = f"{job['model']}__{job['task']}__seed{job['seed']}"
+    parts = [job["model"], _tok_label(job["tokenizer"]), job["task"], job["split"] or "default", f"seed{job['seed']}"]
+    tag = "__".join(parts)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"{tag}.log"
     start = time.time()
@@ -121,7 +138,12 @@ def main() -> None:
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--val-batch", type=int, default=64)
     p.add_argument("--epochs", type=int, default=None)
-    p.add_argument("--tokenizer", default=None, help="For --models scratch.")
+    p.add_argument(
+        "--tokenizer",
+        default=None,
+        help="For --models scratch: one or a COMMA-SEPARATED list of tokenizers to sweep "
+        "(e.g. aa,/path/puma.json,/path/bpe.json). Ignored for non-scratch models.",
+    )
     p.add_argument(
         "--parent-collapse",
         action="store_true",
@@ -135,7 +157,7 @@ def main() -> None:
         help="Scratch Transformer blocks: 0 = bag-of-tokens floor; 1-2 = small model with context.",
     )
     p.add_argument("--scratch-heads", type=int, default=8, help="Attention heads per scratch block (must divide --scratch-dim).")
-    p.add_argument("--split-method", default=None)
+    p.add_argument("--split-method", default=None, help="One split, 'all', or omit (groups run all curated splits).")
     p.add_argument("--wandb_project", default=None)
     p.add_argument("--wandb_group", default=None)
     p.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="Extra flags passed verbatim to the CLI.")
@@ -154,8 +176,9 @@ def main() -> None:
             status = "PASS" if code == 0 else f"FAIL({code})"
             if code != 0:
                 failed += 1
-            tag = f"{job['model']}/{job['task']}/seed{job['seed']}"
-            print(f"[{done}/{len(jobs)}] {status:9} {tag:50} {secs:6.0f}s", flush=True)
+            tok = _tok_label(job["tokenizer"])
+            tag = f"{job['model']}/{tok}/{job['task']}/{job['split'] or 'default'}/seed{job['seed']}"
+            print(f"[{done}/{len(jobs)}] {status:9} {tag:62} {secs:6.0f}s", flush=True)
 
     print(f"\nFinished: {len(jobs) - failed} ok, {failed} failed. See {LOG_DIR} for per-job logs.")
     sys.exit(1 if failed else 0)

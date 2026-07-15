@@ -18,7 +18,7 @@ from plm_benchmark.config import (
 )
 from plm_benchmark.methods import WandbConfig, run_downstream
 from plm_benchmark.results import append_experiment, build_comparison, load_experiments
-from plm_benchmark.tasks import TASKS, load_splits, resolve_tasks
+from plm_benchmark.tasks import TASKS, load_splits, resolve_task_splits
 
 
 def _parse_seeds(args: argparse.Namespace) -> list[int]:
@@ -50,16 +50,15 @@ def cmd_train(args: argparse.Namespace) -> None:
             "--parent-collapse only applies to --model scratch. Pretrained parent-collapsed "
             "(_PC) checkpoints are detected and handled automatically."
         )
-    tasks = resolve_tasks(args.task)
+    task_splits = resolve_task_splits(args.task, args.split_method)
     seeds = _parse_seeds(args)
     wandb_cfg = _wandb_cfg(args)
 
-    for name in tasks:
+    for name, split in task_splits:
         spec = TASKS[name]
-        split = args.split_method or spec.default_split
         for seed in seeds:
             try:
-                train, valid, test = load_splits(spec, split_method=args.split_method)
+                train, valid, test = load_splits(spec, split_method=split)
                 run_downstream(
                     spec,
                     model_cfg,
@@ -89,7 +88,7 @@ def cmd_train(args: argparse.Namespace) -> None:
                     test_df=test,
                 )
             except Exception as e:
-                print(f"FAILED {name} seed={seed}: {e}")
+                print(f"FAILED {name} split={split or 'default'} seed={seed}: {e}")
                 now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 append_experiment(
                     {
@@ -135,24 +134,26 @@ def cmd_list(_: argparse.Namespace) -> None:
 
 
 def cmd_list_tasks(_: argparse.Namespace) -> None:
-    from plm_benchmark.peta_data import PETA_DEFAULT_SPLIT, PETA_SPLIT_OPTIONS
+    from plm_benchmark.peta_data import PETA_RUN_SPLITS, PETA_SPLIT_OPTIONS
 
     print("=== Rost (Schmirler / Nat Commun 2024) ===")
     for name, spec in sorted((k, v) for k, v in TASKS.items() if v.data_source == "rost"):
         print(f"  {name:10} {spec.task_type:14} metric={spec.metric}")
 
-    print("\n=== PETA (ProteinPretraining) ===")
+    print("\n=== PETA (ProteinPretraining) ===  (runs=splits under everything/--split-method all)")
     for name, spec in sorted((k, v) for k, v in TASKS.items() if v.data_source == "peta"):
         split = ""
         if spec.peta_key and spec.peta_key in PETA_SPLIT_OPTIONS:
-            default = spec.default_split or PETA_DEFAULT_SPLIT.get(spec.peta_key, "")
-            split = f" splits={PETA_SPLIT_OPTIONS[spec.peta_key]} default={default}"
+            runs = PETA_RUN_SPLITS.get(spec.peta_key, [spec.default_split])
+            split = f" runs={runs} (all options: {PETA_SPLIT_OPTIONS[spec.peta_key]})"
         status = " [PPI: attention1d pool + sum]" if spec.task_type == "ppi" else ""
         print(
             f"  {name:22} {spec.task_type:14} labels={spec.num_labels:4} "
             f"metric={spec.metric}{split}{status}"
         )
 
+    print("\nSplits: `everything`/`peta_all` run every task's curated splits; --split-method all")
+    print("  runs all splits of a named task; --split-method X runs one; omit for the default only.")
     print("\nAll tasks share one PyTorch pipeline: attention1d pooling + linear head.")
     print("  full_ft -> train encoder; embed_head -> freeze encoder (train head only); lora -> adapters.")
     print(
@@ -198,7 +199,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"Early-stopping patience in eval events (0 disables; default {EARLY_STOPPING_PATIENCE})",
     )
-    t.add_argument("--split-method", default=None, help="PETA split (e.g. one_vs_rest for peta_gb1)")
+    t.add_argument(
+        "--split-method",
+        default=None,
+        help="PETA split for the named task(s): a specific split (e.g. one_vs_rest), or 'all' "
+        "to run every curated split. Ignored for groups (all/peta_all/everything), which "
+        "always run every curated split. Omit to run the default split only.",
+    )
     t.add_argument("--model", default=DEFAULT_MODEL, help=f"Registry name or 'scratch' (default: {DEFAULT_MODEL})")
     t.add_argument("--checkpoint", default=None, help="Local checkpoint dir override")
     t.add_argument(

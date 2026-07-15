@@ -218,6 +218,17 @@ PETA_DEFAULT_SPLIT: dict[str, str] = {
     "deeploc_2": "test",
 }
 
+# Curated splits to enumerate for a task under groups (all/peta_all/everything) or
+# `--split-method all`. Keyed by peta_key; default split first. Any split in
+# PETA_SPLIT_OPTIONS is still runnable explicitly via --split-method even if omitted here.
+PETA_RUN_SPLITS: dict[str, list[str]] = {
+    "gb1": ["one_vs_rest", "two_vs_rest", "three_vs_rest", "low_vs_high"],
+    "aav": ["seven_vs_many", "des_mut", "mut_des", "two_vs_many", "one_vs_many", "low_vs_high"],
+    "meltome": ["human", "mixed_split", "human_cell"],
+    "remote_homology": ["family_holdout", "fold_holdout", "superfamily_holdout"],
+    "deeploc_2": ["test", "hpa_test"],
+}
+
 
 def load_peta_splits(
     peta_key: str,
