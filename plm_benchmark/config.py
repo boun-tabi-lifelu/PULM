@@ -62,8 +62,8 @@ LR_SCRATCH = 1e-3  # scratch baseline: random init, no weights to preserve
 LR_LORA = 3e-4
 
 # Unified downstream recipe — same for every task (Rost + PETA). CLI can override.
-MAX_EPOCHS = 50
-EARLY_STOPPING_PATIENCE = 10
+MAX_EPOCHS = 20
+EARLY_STOPPING_PATIENCE = 5
 WEIGHT_DECAY = 0.01
 
 FINETUNE_SEEDS: tuple[int, ...] = (42, 43, 44)
