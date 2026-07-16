@@ -80,6 +80,9 @@ def cmd_train(args: argparse.Namespace) -> None:
                     scratch_dim=args.scratch_dim,
                     scratch_layers=args.scratch_layers,
                     scratch_heads=args.scratch_heads,
+                    embed_cache=args.embed_cache,
+                    embed_cache_dir=args.embed_cache_dir,
+                    embed_cache_max_gb=args.embed_cache_max_gb,
                     num_workers=args.num_workers,
                     wandb_cfg=wandb_cfg,
                     resume_from_checkpoint=args.resume_from_checkpoint,
@@ -257,6 +260,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help="Attention heads per scratch Transformer block (used when --scratch-layers>0; "
         "must divide --scratch-dim).",
+    )
+    t.add_argument(
+        "--embed-cache",
+        action="store_true",
+        help="embed_head fast path: cache the frozen encoder's per-residue outputs once and "
+        "train the attention1d head off the cache (numerically identical, ~epochs-fold faster).",
+    )
+    t.add_argument("--embed-cache-dir", default=None, help="Cache location (default: outputs/embeddings)")
+    t.add_argument(
+        "--embed-cache-max-gb",
+        type=float,
+        default=50.0,
+        help="Skip the cache and encode on the fly if the estimate exceeds this.",
     )
     t.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     t.add_argument("--resume-from-checkpoint", default=None, help="Path to a Trainer checkpoint to resume")

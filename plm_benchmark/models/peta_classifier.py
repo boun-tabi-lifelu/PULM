@@ -66,10 +66,17 @@ class EsmPetaClassifier(nn.Module):
             return nn.functional.binary_cross_entropy_with_logits(logits, labels.float())
         return nn.functional.cross_entropy(logits, labels.long())
 
-    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs) -> SequenceClassifierOutput:
-        ctx = torch.no_grad() if self.freeze_encoder else nullcontext()
-        with ctx:
-            hidden = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+    def forward(
+        self, input_ids=None, attention_mask=None, labels=None, hidden_states=None, **kwargs
+    ) -> SequenceClassifierOutput:
+        if hidden_states is not None:
+            # embed_head cache fast path: encoder outputs precomputed (frozen encoder,
+            # so these are identical to running it here). Skip the encoder entirely.
+            hidden = hidden_states
+        else:
+            ctx = torch.no_grad() if self.freeze_encoder else nullcontext()
+            with ctx:
+                hidden = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         logits = self.head(hidden, attention_mask)
         loss = self._loss(logits, labels)
         return SequenceClassifierOutput(loss=loss, logits=logits)

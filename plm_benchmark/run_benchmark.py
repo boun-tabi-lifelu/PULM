@@ -92,6 +92,10 @@ def job_cmd(job: dict, args) -> list[str]:
         cmd += ["--tokenizer", job["tokenizer"]]
     if args.parent_collapse:
         cmd += ["--parent-collapse"]
+    if args.embed_cache:
+        cmd += ["--embed-cache", "--embed-cache-max-gb", str(args.embed_cache_max_gb)]
+        if args.embed_cache_dir:
+            cmd += ["--embed-cache-dir", args.embed_cache_dir]
     if job["split"]:
         cmd += ["--split-method", job["split"]]
     if args.epochs:
@@ -149,6 +153,9 @@ def main() -> None:
         action="store_true",
         help="Scratch + PUMA: fold children onto mutational parents (reduced vocab).",
     )
+    p.add_argument("--embed-cache", action="store_true", help="embed_head: cache frozen-encoder outputs.")
+    p.add_argument("--embed-cache-dir", default=None)
+    p.add_argument("--embed-cache-max-gb", type=float, default=50.0)
     p.add_argument("--scratch-dim", type=int, default=320, help="Scratch embedding/hidden dim.")
     p.add_argument(
         "--scratch-layers",

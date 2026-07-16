@@ -23,6 +23,7 @@ EXPERIMENT_FIELDS = [
     "task",
     "model",
     "tokenizer",
+    "vocab_size",
     "method",
     "split",
     "metric",
@@ -104,6 +105,9 @@ def build_comparison(log_path: Path = LOG_CSV, out_path: Path = COMPARE_CSV) -> 
         metric = sub["metric"].iloc[0]
         scores = sub["test_score"].dropna()
         vals = sub["val_score"].dropna()
+        # constant within a (model, tokenizer) group; carried through for readability
+        if "vocab_size" in sub.columns:
+            record["vocab_size"] = sub["vocab_size"].iloc[0]
         rows.append(
             {
                 **record,

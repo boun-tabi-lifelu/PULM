@@ -17,6 +17,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache, partial
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -214,6 +215,54 @@ def _test_score(model, tokenizer, test_df, spec, collator, *, batch_size: int) -
     return score_predictions(np.concatenate(preds, axis=0), np.concatenate(labels, axis=0), spec)
 
 
+def _setup_embed_cache(
+    model, tokenizer, spec, model_name, tokenizer_name, split_tag, train_df, valid_df,
+    *, checkpoint, max_length, batch_size, cache_dir, max_gb,
+):
+    """Build/load the frozen-encoder cache. Returns (train_ds, valid_ds, collator) or None
+    to fall back to on-the-fly encoding (over budget / unusable)."""
+    from plm_benchmark.methods.data import label_dtype
+    from plm_benchmark.methods.embed_cache import (
+        CachedHidden,
+        CachedHiddenDataset,
+        build_cache,
+        collate_cached,
+        estimate_bytes,
+        _subset_dir,
+    )
+
+    base = Path(cache_dir) if cache_dir else (OUTPUTS_DIR / "embeddings")
+    hidden_size = model.encoder.config.hidden_size
+    lens = [len(s) for s in list(train_df["sequence"]) + list(valid_df["sequence"])]
+    est_gb = estimate_bytes(lens, hidden_size, max_length) / 1e9
+    if est_gb > max_gb:
+        print(
+            f"NOTE: embed cache ~{est_gb:.1f} GB exceeds --embed-cache-max-gb {max_gb:g}; "
+            "encoding on the fly instead.",
+            flush=True,
+        )
+        return None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    stores = {}
+    for subset, df in (("train", train_df), ("valid", valid_df)):
+        path = _subset_dir(base, model_name, tokenizer_name, spec.name, split_tag, subset)
+        if not CachedHidden.matches(path, checkpoint, max_length):
+            print(f"[embed-cache] building {subset} ({len(df)} seqs, ~{est_gb:.1f} GB total) -> {path}", flush=True)
+            build_cache(
+                path, model.encoder, tokenizer, list(df["sequence"]),
+                checkpoint=checkpoint, max_length=max_length, batch_size=batch_size, device=device,
+            )
+        else:
+            print(f"[embed-cache] reusing {subset} cache -> {path}", flush=True)
+        stores[subset] = CachedHidden(path)
+
+    dtype = label_dtype(spec)
+    train_ds = CachedHiddenDataset(stores["train"], list(train_df["label"]), [len(s) for s in train_df["sequence"]])
+    valid_ds = CachedHiddenDataset(stores["valid"], list(valid_df["label"]), [len(s) for s in valid_df["sequence"]])
+    return train_ds, valid_ds, partial(collate_cached, label_dtype=dtype)
+
+
 def _best_val(history, metric_key: str, greater_is_better: bool):
     vals = [x[metric_key] for x in history if metric_key in x]
     if not vals:
@@ -243,6 +292,9 @@ def run_downstream(
     scratch_dim: int = 320,
     scratch_layers: int = 0,
     scratch_heads: int = 8,
+    embed_cache: bool = False,
+    embed_cache_dir: str | None = None,
+    embed_cache_max_gb: float = 50.0,
     num_workers: int = 4,
     wandb_cfg: WandbConfig | None = None,
     resume_from_checkpoint: str | None = None,
@@ -324,6 +376,34 @@ def run_downstream(
         collator = partial(collate_ppi, tokenizer=tokenizer, max_length=max_length)
     else:
         collator = partial(collate_single, tokenizer=tokenizer, max_length=max_length, spec=spec)
+    test_collator = collator  # test always runs through the real encoder
+
+    # embed_head fast path: the frozen encoder's per-residue outputs are identical every
+    # epoch, so compute them once and train the attention1d head off the cache.
+    cached_mode = False
+    if embed_cache and freeze and not is_ppi:
+        cached = _setup_embed_cache(
+            model,
+            tokenizer,
+            spec,
+            model_name,
+            tokenizer_name,
+            split_tag,
+            train_df,
+            valid_df,
+            checkpoint=model_cfg.checkpoint,
+            max_length=max_length,
+            batch_size=val_batch,
+            cache_dir=embed_cache_dir,
+            max_gb=embed_cache_max_gb,
+        )
+        if cached is not None:
+            train_ds, valid_ds, collator = cached
+            cached_mode = True
+    elif embed_cache and not freeze:
+        print("NOTE: --embed-cache only applies to --method embed_head (frozen encoder); ignoring.", flush=True)
+    elif embed_cache and is_ppi:
+        print("NOTE: --embed-cache is not supported for PPI tasks (paired inputs); ignoring.", flush=True)
 
     # Eval/checkpoint cadence: every epoch by default (unchanged behaviour). When
     # eval_every > 1, switch to a steps schedule so we eval + checkpoint every
@@ -361,7 +441,7 @@ def run_downstream(
         seed=seed,
         fp16=fp16 and not use_bf16,
         bf16=use_bf16,
-        group_by_length=True,
+        group_by_length=not cached_mode,
         length_column_name="length",
         dataloader_num_workers=num_workers,
         dataloader_pin_memory=True,
@@ -394,7 +474,7 @@ def run_downstream(
     weights = run_dir / "finetuned_weights.pth"
     torch.save({n: p for n, p in model.named_parameters() if p.requires_grad}, weights)
 
-    test = _test_score(model, tokenizer, test_df, spec, collator, batch_size=val_batch)
+    test = _test_score(model, tokenizer, test_df, spec, test_collator, batch_size=val_batch)
     val = _best_val(trainer.state.log_history, metric_for_best, spec.greater_is_better)
     print(f"Test {spec.metric}: {test:.4f} | best val: {val}", flush=True)
 
@@ -410,6 +490,8 @@ def run_downstream(
         "task": spec.name,
         "model": model_name,
         "tokenizer": tokenizer_name,
+        # actual embedding rows -> the POST-collapse size for parent-collapsed runs
+        "vocab_size": getattr(model.encoder.config, "vocab_size", ""),
         "method": method,
         "split": split_tag,
         "metric": spec.metric,

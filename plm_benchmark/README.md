@@ -180,6 +180,28 @@ Also: `--wandb_run_name`, `--wandb_group`, `--wandb_entity`,
 `--wandb_mode {online,offline,disabled}`, and `--wandb_run_id`/`--wandb_resume` together with
 `--resume-from-checkpoint` to continue a run.
 
+## FLIP splits: regenerate from `raw/` (required once)
+
+The PETA-shipped JSONs for `flip/{aav,gb1,meltome}` are broken: **`valid.json` is a byte-identical
+copy of `test.json`** (so early stopping and best-checkpoint selection ran on test), and
+`train.json` is `SET=train` *including* the validation rows. `raw/<split>.fasta` is the source of
+truth. Regenerate them:
+
+```bash
+python scripts/regen_flip_splits.py --dry-run   # preview counts
+python scripts/regen_flip_splits.py            # delete + rewrite train/valid/test.json
+```
+
+Canonical FLIP semantics: `SET=train & VALIDATION=False` → train, `SET=train & VALIDATION=True` →
+validation, `SET=test` → test, anything else (`SET=nan`) excluded. The script pins
+`gb1/three_vs_rest = 2691/299/5743` and `aav/two_vs_many = 28626/3181/50776`.
+
+**Split guard.** Every `load_splits` call runs `assert_splits_sane`: it **hard-fails** if validation
+is identical to test (or >25% of it appears in test) and **warns** on the incidental duplicate
+sequences FLIP genuinely ships (records stay disjoint). It also warns loudly when a validation set
+is tiny — `gb1/one_vs_rest` has only **3** validation sequences after the rebuild, so best-val
+selection there is noise; it's excluded from the curated sweep but still runnable explicitly.
+
 ## Data layout
 
 Place the downloaded datasets under `plm_benchmark/data/` (auto-detected):
@@ -196,7 +218,8 @@ root are still detected as a fallback.)
 ## Outputs
 
 - `outputs/experiments.csv` — one row per run. Key columns: `start_datetime`, `end_datetime`,
-  `duration_sec`, `task`, **`model`**, **`tokenizer`**, `method`, `split`, `metric`,
+  `duration_sec`, `task`, **`model`**, **`tokenizer`**, **`vocab_size`** (actual embedding rows —
+  the *post-collapse* size for parent-collapsed runs), `method`, `split`, `metric`,
   `test_score`, `val_score`, `epochs`, `lr`, `batch`, `seed`, `full_name` (original
   registry/slug name), `scratch_dim/layers/heads` (scratch runs only), `git_commit`,
   `checkpoint_policy`, `checkpoint`, `run_dir`. `model`/`tokenizer` are split from the raw
@@ -283,6 +306,27 @@ Tuning knobs:
 
 > Job count multiplies fast: `everything` (37 task×split) × models × tokenizers × seeds. Check
 > `len(jobs)` printed at launch before committing to a big grid.
+
+### `embed_head` fast path: `--embed-cache`
+
+A frozen encoder produces **identical** per-residue outputs every epoch, so recomputing them for
+50 epochs is pure waste. `--embed-cache` computes them once and trains the attention1d head off the
+cache — **numerically identical** (the frozen encoder is already forced to `eval()`), just ~epochs-fold
+faster. Only `train`+`valid` are cached; test is scored once through the real encoder.
+
+```bash
+python -m plm_benchmark.cli train --task peta_gb1 --method embed_head --model esm2_35m \
+    --embed-cache --embed-cache-dir /scratch/emb --embed-cache-max-gb 40
+```
+
+- **Key**: `<cache-dir>/<model>/<tokenizer>/<task>/<split>/{train,valid}/` with a `meta.json`
+  recording checkpoint + `max_length` + dtype; a mismatch rebuilds automatically.
+- **Storage**: ragged (no padding waste) — a memmapped `[total_tokens, H]` fp16 array + offsets, so a
+  20 GB cache never lands in RAM.
+- **Budget**: `--embed-cache-max-gb` (default 50) — over budget it warns and encodes on the fly.
+  Rough sizes (ESM2-35M, train+val): `gb1` ~0.2 GB, `meltome/human` ~4 GB, `aav/two_vs_many` ~23 GB,
+  `aav/des_mut` ~142 GB (falls back).
+- Applies only to `--method embed_head`; PPI tasks are unsupported (paired inputs) and fall back.
 
 ### Faster long runs: `--eval-every` and `--val-batch`
 

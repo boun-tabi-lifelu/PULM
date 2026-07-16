@@ -28,6 +28,7 @@ from transformers.modeling_outputs import BaseModelOutput
 @dataclass
 class ScratchConfig:
     hidden_size: int
+    vocab_size: int = 0  # embedding rows (post-collapse size for parent-collapsed runs)
     model_type: str = "scratch"
 
 
@@ -50,7 +51,7 @@ class ScratchEncoder(nn.Module):
                 f"scratch hidden_size ({hidden_size}) must be divisible by "
                 f"--scratch-heads ({num_heads})."
             )
-        self.config = ScratchConfig(hidden_size=hidden_size)
+        self.config = ScratchConfig(hidden_size=hidden_size, vocab_size=vocab_size)
         self.token = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_token_id)
         self.position = nn.Embedding(max_position, hidden_size)
         self.norm = nn.LayerNorm(hidden_size)

@@ -126,6 +126,58 @@ def resolve_task_splits(task_arg: str, split_method: str | None = None) -> list[
     return pairs
 
 
+# Split-sanity guard. `valid == test` (the FLIP loader bug) must fail loudly; incidental
+# duplicate sequences across sets exist as the data ships (e.g. aav) and only warn.
+MAX_VAL_TEST_OVERLAP = 0.25  # fraction of validation allowed to appear in test
+TINY_VAL_WARN = 50  # below this, best-val selection / early stopping is mostly noise
+
+
+def _row_keys(df: pd.DataFrame) -> set:
+    if "sequence_a" in df.columns:
+        return set(zip(df["sequence_a"].astype(str), df["sequence_b"].astype(str)))
+    return set(df["sequence"].astype(str))
+
+
+def assert_splits_sane(train, valid, test, *, task: str, split: str | None = None) -> None:
+    """Fail loudly on val/test contamination; warn on benign overlaps. All tasks."""
+    tag = f"{task}/{split}" if split else task
+    if len(valid) == 0:
+        raise ValueError(f"{tag}: empty validation set.")
+    if len(test) == 0:
+        raise ValueError(f"{tag}: empty test set.")
+
+    v, e, t = _row_keys(valid), _row_keys(test), _row_keys(train)
+    if v == e:
+        raise ValueError(
+            f"{tag}: validation set is IDENTICAL to test ({len(valid)} rows) — early stopping and "
+            f"best-checkpoint selection would run on test. Fix the loader/data for this split."
+        )
+    inter = len(v & e)
+    frac = inter / max(1, len(v))
+    if frac > MAX_VAL_TEST_OVERLAP:
+        raise ValueError(
+            f"{tag}: {inter}/{len(valid)} ({frac:.1%}) of validation also appears in test — "
+            f"exceeds the {MAX_VAL_TEST_OVERLAP:.0%} guard."
+        )
+
+    warns = []
+    if inter:
+        warns.append(f"val&test={inter}")
+    if len(t & e):
+        warns.append(f"train&test={len(t & e)}")
+    if len(t & v):
+        warns.append(f"train&val={len(t & v)}")
+    if warns:
+        warns.append("(duplicate sequences as the data ships; records are disjoint)")
+    if len(valid) < TINY_VAL_WARN:
+        warns.append(
+            f"!! TINY VALIDATION ({len(valid)} rows): best-val selection and early stopping are "
+            f"essentially noise for this split"
+        )
+    if warns:
+        print(f"WARNING [{tag}]: " + "; ".join(warns), flush=True)
+
+
 def preprocess_sequences(df: pd.DataFrame, *, task_type: str = "regression") -> pd.DataFrame:
     if task_type == "ppi":
         return df.copy()
@@ -152,26 +204,30 @@ def load_splits(
     *,
     split_method: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    split = split_method or spec.default_split
+
     if spec.data_source == "peta":
         from plm_benchmark.peta_data import load_peta_splits
 
-        split = split_method or spec.default_split
-        return load_peta_splits(spec.peta_key, split_method=split, data_dir=data_dir)
+        train, valid, test = load_peta_splits(spec.peta_key, split_method=split, data_dir=data_dir)
+    else:
+        root = (data_dir or DATA_DIR) / spec.folder
+        if not root.is_dir():
+            raise FileNotFoundError(
+                f"Missing {root}. Setup data:\n"
+                f"  clone https://github.com/RSchmirler/data-repo_plm-finetune-eval"
+            )
 
-    root = (data_dir or DATA_DIR) / spec.folder
-    if not root.is_dir():
-        raise FileNotFoundError(
-            f"Missing {root}. Setup data:\n"
-            f"  clone https://github.com/RSchmirler/data-repo_plm-finetune-eval"
-        )
+        def _load(name: str) -> pd.DataFrame:
+            df = pd.read_pickle(root / f"{name}.pkl")
+            out = pd.DataFrame({"sequence": df[spec.seq_col].astype(str), "label": df[spec.label_col]})
+            if spec.task_type == "classification":
+                out["label"] = out["label"].astype(int)
+            else:
+                out["label"] = out["label"].astype(float)
+            return out.reset_index(drop=True)
 
-    def _load(split: str) -> pd.DataFrame:
-        df = pd.read_pickle(root / f"{split}.pkl")
-        out = pd.DataFrame({"sequence": df[spec.seq_col].astype(str), "label": df[spec.label_col]})
-        if spec.task_type == "classification":
-            out["label"] = out["label"].astype(int)
-        else:
-            out["label"] = out["label"].astype(float)
-        return out.reset_index(drop=True)
+        train, valid, test = _load("train"), _load("valid"), _load("test")
 
-    return _load("train"), _load("valid"), _load("test")
+    assert_splits_sane(train, valid, test, task=spec.name, split=split)
+    return train, valid, test
