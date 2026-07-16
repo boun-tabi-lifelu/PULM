@@ -267,10 +267,14 @@ def _setup_embed_cache(
 def _cached_trainer_class(lengths):
     """Trainer for the embed-cache path.
 
-    The cached dataset is a plain torch Dataset, so Trainer can't infer lengths for
-    group_by_length (it looks for `input_ids`). Supply them explicitly — the same
-    per-sequence char lengths the uncached path groups on — so cached and uncached
-    runs see the same batch composition.
+    The cached dataset is a plain torch Dataset, not a `datasets.Dataset`, so Trainer
+    cannot read a `length` column and falls back to inferring lengths from `input_ids`
+    (which cached items don't have) -> "Can only automatically infer lengths ...".
+    Both samplers must therefore be supplied explicitly:
+      * train: LengthGroupedSampler over the same per-sequence char lengths the uncached
+        path groups on, so batch composition matches.
+      * eval:  sequential. Eval batch composition cannot affect the metric (pooling is
+        per-sequence and masked; all predictions are aggregated), so this is safe.
     """
 
     class _CachedTrainer(Trainer):
@@ -288,6 +292,14 @@ def _cached_trainer_class(lengths):
                     flush=True,
                 )
                 return RandomSampler(self.train_dataset)
+
+        def _get_eval_sampler(self, *args, **kwargs):
+            from torch.utils.data import SequentialSampler
+
+            ds = args[0] if args else kwargs.get("eval_dataset", None)
+            if ds is None:
+                ds = self.eval_dataset
+            return SequentialSampler(ds)
 
     return _CachedTrainer
 
