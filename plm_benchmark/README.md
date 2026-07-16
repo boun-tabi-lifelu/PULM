@@ -311,8 +311,17 @@ Tuning knobs:
 
 A frozen encoder produces **identical** per-residue outputs every epoch, so recomputing them for
 50 epochs is pure waste. `--embed-cache` computes them once and trains the attention1d head off the
-cache — **numerically identical** (the frozen encoder is already forced to `eval()`), just ~epochs-fold
-faster. Only `train`+`valid` are cached; test is scored once through the real encoder.
+cache, ~epochs-fold faster. Only `train`+`valid` are cached; test is always scored through the real
+encoder, so the test evaluation itself is unchanged.
+
+**Equivalence with the uncached path.** The cache is built under the *same* autocast dtype training
+uses (bf16), and fp16 storage is exact for bf16 values (10 ≥ 7 mantissa bits), so the cached encoder
+outputs match what the live path computes. Length grouping is preserved via an explicit
+`LengthGroupedSampler` over the same per-sequence lengths, so batch composition matches too. Expect
+cached and uncached runs to agree to within float noise — but they are not bit-guaranteed, so **pick
+one and keep it consistent across an arm you're comparing** (don't cache one model's `embed_head` and
+not another's). The frozen encoder is forced to `eval()` in both paths, so there is no dropout
+nondeterminism either way.
 
 ```bash
 python -m plm_benchmark.cli train --task peta_gb1 --method embed_head --model esm2_35m \
@@ -322,7 +331,9 @@ python -m plm_benchmark.cli train --task peta_gb1 --method embed_head --model es
 - **Key**: `<cache-dir>/<model>/<tokenizer>/<task>/<split>/{train,valid}/` with a `meta.json`
   recording checkpoint + `max_length` + dtype; a mismatch rebuilds automatically.
 - **Storage**: ragged (no padding waste) — a memmapped `[total_tokens, H]` fp16 array + offsets, so a
-  20 GB cache never lands in RAM.
+  20 GB cache never lands in RAM. fp16 (not bf16) is deliberate: it holds bf16 values exactly and is
+  finer than the bf16 the head consumes. Its one risk is range (|x| > 65504), which is guarded — the
+  build fails loudly rather than writing `inf`.
 - **Budget**: `--embed-cache-max-gb` (default 50) — over budget it warns and encodes on the fly.
   Rough sizes (ESM2-35M, train+val): `gb1` ~0.2 GB, `meltome/human` ~4 GB, `aav/two_vs_many` ~23 GB,
   `aav/des_mut` ~142 GB (falls back).

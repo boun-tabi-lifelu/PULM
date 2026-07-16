@@ -16,6 +16,7 @@ is scored once at the end through the real encoder.
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -80,9 +81,24 @@ class CachedHidden:
 
 @torch.no_grad()
 def build_cache(
-    path: Path, encoder, tokenizer, sequences, *, checkpoint: str, max_length: int, batch_size: int, device
+    path: Path,
+    encoder,
+    tokenizer,
+    sequences,
+    *,
+    checkpoint: str,
+    max_length: int,
+    batch_size: int,
+    device,
+    amp_dtype=None,
 ) -> None:
-    """Run the frozen encoder once over `sequences` and write the ragged cache."""
+    """Run the frozen encoder once over `sequences` and write the ragged cache.
+
+    `amp_dtype` must be the SAME autocast dtype training uses (bf16), so the cached
+    states equal what the on-the-fly path would produce. fp16 storage is exact for
+    bf16 values (10 >= 7 mantissa bits); the guard below catches the one fp16 risk,
+    which is range (|x| > 65504 -> inf).
+    """
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     encoder.to(device).eval()
@@ -98,9 +114,22 @@ def build_cache(
             tok = tokenizer(chunk, max_length=max_length, padding=True, truncation=True, return_tensors="pt")
             ids = tok["input_ids"].to(device)
             mask = tok["attention_mask"].to(device)
-            out = encoder(input_ids=ids, attention_mask=mask).last_hidden_state  # [B, L, H]
+            ctx = (
+                torch.autocast(device_type=device.type, dtype=amp_dtype)
+                if amp_dtype is not None and device.type == "cuda"
+                else nullcontext()
+            )
+            with ctx:
+                out = encoder(input_ids=ids, attention_mask=mask).last_hidden_state  # [B, L, H]
             lens = mask.sum(dim=1).tolist()
-            out = out.to(torch.float16).cpu().numpy()
+            out16 = out.to(torch.float16)
+            if not torch.isfinite(out16).all():
+                raise ValueError(
+                    f"embed cache: non-finite values after the fp16 cast (max|x|="
+                    f"{out.abs().max().item():.1f}). Encoder outputs exceed fp16 range (65504) — "
+                    f"the cache would be silently corrupted. Re-run without --embed-cache."
+                )
+            out = out16.cpu().numpy()
             for j, n in enumerate(lens):
                 fh.write(out[j, : int(n)].astype(CACHE_DTYPE).tobytes())
                 written += int(n)

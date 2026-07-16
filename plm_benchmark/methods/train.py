@@ -217,7 +217,7 @@ def _test_score(model, tokenizer, test_df, spec, collator, *, batch_size: int) -
 
 def _setup_embed_cache(
     model, tokenizer, spec, model_name, tokenizer_name, split_tag, train_df, valid_df,
-    *, checkpoint, max_length, batch_size, cache_dir, max_gb,
+    *, checkpoint, max_length, batch_size, cache_dir, max_gb, amp_dtype=None,
 ):
     """Build/load the frozen-encoder cache. Returns (train_ds, valid_ds, collator) or None
     to fall back to on-the-fly encoding (over budget / unusable)."""
@@ -251,7 +251,8 @@ def _setup_embed_cache(
             print(f"[embed-cache] building {subset} ({len(df)} seqs, ~{est_gb:.1f} GB total) -> {path}", flush=True)
             build_cache(
                 path, model.encoder, tokenizer, list(df["sequence"]),
-                checkpoint=checkpoint, max_length=max_length, batch_size=batch_size, device=device,
+                checkpoint=checkpoint, max_length=max_length, batch_size=batch_size,
+                device=device, amp_dtype=amp_dtype,
             )
         else:
             print(f"[embed-cache] reusing {subset} cache -> {path}", flush=True)
@@ -261,6 +262,34 @@ def _setup_embed_cache(
     train_ds = CachedHiddenDataset(stores["train"], list(train_df["label"]), [len(s) for s in train_df["sequence"]])
     valid_ds = CachedHiddenDataset(stores["valid"], list(valid_df["label"]), [len(s) for s in valid_df["sequence"]])
     return train_ds, valid_ds, partial(collate_cached, label_dtype=dtype)
+
+
+def _cached_trainer_class(lengths):
+    """Trainer for the embed-cache path.
+
+    The cached dataset is a plain torch Dataset, so Trainer can't infer lengths for
+    group_by_length (it looks for `input_ids`). Supply them explicitly — the same
+    per-sequence char lengths the uncached path groups on — so cached and uncached
+    runs see the same batch composition.
+    """
+
+    class _CachedTrainer(Trainer):
+        def _get_train_sampler(self, *args, **kwargs):
+            from torch.utils.data import RandomSampler
+
+            try:
+                from transformers.trainer_pt_utils import LengthGroupedSampler
+
+                bs = self.args.train_batch_size * self.args.gradient_accumulation_steps
+                return LengthGroupedSampler(bs, lengths=list(lengths))
+            except Exception as e:  # version drift -> degrade, don't crash
+                print(
+                    f"NOTE: length grouping unavailable for the cached path ({e}); using a random sampler.",
+                    flush=True,
+                )
+                return RandomSampler(self.train_dataset)
+
+    return _CachedTrainer
 
 
 def _best_val(history, metric_key: str, greater_is_better: bool):
@@ -377,6 +406,7 @@ def run_downstream(
     else:
         collator = partial(collate_single, tokenizer=tokenizer, max_length=max_length, spec=spec)
     test_collator = collator  # test always runs through the real encoder
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported() and not fp16
 
     # embed_head fast path: the frozen encoder's per-residue outputs are identical every
     # epoch, so compute them once and train the attention1d head off the cache.
@@ -396,6 +426,7 @@ def run_downstream(
             batch_size=val_batch,
             cache_dir=embed_cache_dir,
             max_gb=embed_cache_max_gb,
+            amp_dtype=(torch.bfloat16 if use_bf16 else (torch.float16 if fp16 else None)),
         )
         if cached is not None:
             train_ds, valid_ds, collator = cached
@@ -424,7 +455,6 @@ def run_downstream(
     else:
         cadence = dict(eval_strategy="epoch", save_strategy="epoch", logging_strategy="epoch")
 
-    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported() and not fp16
     ta_kwargs = dict(
         output_dir=str(run_dir / "hf_cache"),
         **cadence,
@@ -441,7 +471,7 @@ def run_downstream(
         seed=seed,
         fp16=fp16 and not use_bf16,
         bf16=use_bf16,
-        group_by_length=not cached_mode,
+        group_by_length=True,
         length_column_name="length",
         dataloader_num_workers=num_workers,
         dataloader_pin_memory=True,
@@ -468,7 +498,8 @@ def run_downstream(
     else:
         trainer_kwargs["tokenizer"] = tokenizer
 
-    trainer = Trainer(**trainer_kwargs)
+    trainer_cls = _cached_trainer_class(train_ds.lengths) if cached_mode else Trainer
+    trainer = trainer_cls(**trainer_kwargs)
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     weights = run_dir / "finetuned_weights.pth"
