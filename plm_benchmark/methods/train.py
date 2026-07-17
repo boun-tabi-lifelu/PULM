@@ -304,6 +304,19 @@ def _cached_trainer_class(lengths):
     return _CachedTrainer
 
 
+def _collapse_flags(test, val) -> str:
+    """A NaN metric means constant predictions -> the run collapsed, it is not a score."""
+    def _bad(x):
+        return x is None or (isinstance(x, (int, float)) and math.isnan(float(x)))
+
+    flags = []
+    if _bad(test):
+        flags.append("test_nan")
+    if _bad(val):
+        flags.append("val_nan")
+    return ";".join(flags)
+
+
 def _best_val(history, metric_key: str, greater_is_better: bool):
     vals = [x[metric_key] for x in history if metric_key in x]
     if not vals:
@@ -342,7 +355,8 @@ def run_downstream(
     train_df=None,
     valid_df=None,
     test_df=None,
-) -> dict:
+    test_sets=None,
+) -> list[dict]:
     if method not in METHODS:
         raise ValueError(f"Unknown method {method!r}. Choose from {sorted(METHODS)}.")
     if method == "lora" and model_cfg.backend == "scratch":
@@ -365,27 +379,35 @@ def run_downstream(
     set_gpu(gpu)
     _set_seeds(seed)
 
+    split_tag = split or "default"
+    if test_sets is None:
+        test_sets = {split_tag: test_df}
+    multi_test = len(test_sets) > 1
+
     if is_ppi:
-        train_df, valid_df, test_df = preprocess_ppi_splits(train_df, valid_df, test_df)
+        key = next(iter(test_sets))
+        train_df, valid_df, cleaned = preprocess_ppi_splits(train_df, valid_df, test_sets[key])
+        test_sets = {key: cleaned}
         train_ds, valid_ds = ppi_dataset(train_df), ppi_dataset(valid_df)
     else:
         train_df = preprocess_sequences(train_df, task_type=spec.task_type)
         valid_df = preprocess_sequences(valid_df, task_type=spec.task_type)
-        test_df = preprocess_sequences(test_df, task_type=spec.task_type)
+        test_sets = {k: preprocess_sequences(v, task_type=spec.task_type) for k, v in test_sets.items()}
         train_ds, valid_ds = single_dataset(train_df, spec), single_dataset(valid_df, spec)
 
-    split_tag = split or "default"
+    # Splits that share train+valid produce ONE trained model -> one run dir, many rows.
+    train_tag = "shared" if multi_test else split_tag
     # Keyed on (model, tokenizer) so scratch variants (dim/layers/heads) never collide.
-    run_dir = OUTPUTS_DIR / model_name / tokenizer_name / spec.name.lower() / split_tag / method / f"seed_{seed}"
+    run_dir = OUTPUTS_DIR / model_name / tokenizer_name / spec.name.lower() / train_tag / method / f"seed_{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    default_run_name = f"{model_name}/{tokenizer_name}/{spec.name}/{split_tag}/{method}/seed{seed}"
+    default_run_name = f"{model_name}/{tokenizer_name}/{spec.name}/{train_tag}/{method}/seed{seed}"
     default_group = f"{model_name}/{tokenizer_name}"
     report_to, run_name = _setup_wandb(wandb_cfg, default_run_name, default_group, resume_from_checkpoint)
 
     mode = "frozen-encoder" if freeze else ("lora" if use_lora else "full")
     print(
-        f"\n=== {spec.name} | {method} ({mode}) | split={split_tag} | seed={seed} "
+        f"\n=== {spec.name} | {method} ({mode}) | split={train_tag} | seed={seed} "
         f"| model={model_name} tokenizer={tokenizer_name} [{model_cfg.backend}] ===",
         flush=True,
     )
@@ -517,44 +539,64 @@ def run_downstream(
     weights = run_dir / "finetuned_weights.pth"
     torch.save({n: p for n, p in model.named_parameters() if p.requires_grad}, weights)
 
-    test = _test_score(model, tokenizer, test_df, spec, test_collator, batch_size=val_batch)
     val = _best_val(trainer.state.log_history, metric_for_best, spec.greater_is_better)
-    print(f"Test {spec.metric}: {test:.4f} | best val: {val}", flush=True)
+
+    # One trained model -> score every test set that shares this train/valid.
+    scores = {}
+    for s, tdf in test_sets.items():
+        scores[s] = _test_score(model, tokenizer, tdf, spec, test_collator, batch_size=val_batch)
+        print(f"Test[{s}] {spec.metric}: {scores[s]:.4f} | best val: {val}", flush=True)
 
     if "wandb" in report_to:
-        trainer.log({f"test/{spec.metric}": test})
+        if multi_test:
+            trainer.log({f"test/{s}/{spec.metric}": v for s, v in scores.items()})
+        else:
+            trainer.log({f"test/{spec.metric}": next(iter(scores.values()))})
     _finish_wandb(report_to)
 
     end_dt = datetime.now(timezone.utc)
-    row = {
-        "start_datetime": start_dt.strftime(DT_FMT),
-        "end_datetime": end_dt.strftime(DT_FMT),
-        "duration_sec": round((end_dt - start_dt).total_seconds(), 1),
-        "task": spec.name,
-        "model": model_name,
-        "tokenizer": tokenizer_name,
-        # actual embedding rows -> the POST-collapse size for parent-collapsed runs
-        "vocab_size": getattr(model.encoder.config, "vocab_size", ""),
-        "method": method,
-        "split": split_tag,
-        "metric": spec.metric,
-        "test_score": round(test, 6),
-        "val_score": round(val, 6) if val is not None else "",
-        "epochs": epochs,
-        "lr": lr,
-        "batch": batch,
-        "seed": seed,
-        "full_name": model_cfg.name,
-        "scratch_dim": scratch_dim if is_scratch else "",
-        "scratch_layers": scratch_layers if is_scratch else "",
-        "scratch_heads": scratch_heads if is_scratch else "",
-        "git_commit": _git_commit(),
-        "checkpoint_policy": CHECKPOINT_POLICY,
-        "checkpoint": model_cfg.checkpoint,
-        "run_dir": str(run_dir.relative_to(OUTPUTS_DIR.parent)),
-    }
-    append_experiment(row)
+    rows = []
+    for s, test in scores.items():
+        flags = _collapse_flags(test, val)
+        if flags:
+            print(
+                f"WARNING [{spec.name}/{s}]: run COLLAPSED ({flags}) — a NaN metric means constant "
+                f"predictions; this is a failed run, not a score.",
+                flush=True,
+            )
+        row = {
+            "start_datetime": start_dt.strftime(DT_FMT),
+            "end_datetime": end_dt.strftime(DT_FMT),
+            # NOTE: shared-train tasks emit several rows from ONE training run, so this
+            # duration is the whole run and is not additive across those rows.
+            "duration_sec": round((end_dt - start_dt).total_seconds(), 1),
+            "task": spec.name,
+            "model": model_name,
+            "tokenizer": tokenizer_name,
+            # actual embedding rows -> the POST-collapse size for parent-collapsed runs
+            "vocab_size": getattr(model.encoder.config, "vocab_size", ""),
+            "method": method,
+            "split": s,
+            "metric": spec.metric,
+            "test_score": round(test, 6),
+            "val_score": round(val, 6) if val is not None else "",
+            "collapsed": flags,
+            "epochs": epochs,
+            "lr": lr,
+            "batch": batch,
+            "seed": seed,
+            "full_name": model_cfg.name,
+            "scratch_dim": scratch_dim if is_scratch else "",
+            "scratch_layers": scratch_layers if is_scratch else "",
+            "scratch_heads": scratch_heads if is_scratch else "",
+            "git_commit": _git_commit(),
+            "checkpoint_policy": CHECKPOINT_POLICY,
+            "checkpoint": model_cfg.checkpoint,
+            "run_dir": str(run_dir.relative_to(OUTPUTS_DIR.parent)),
+        }
+        append_experiment(row)
+        rows.append(row)
 
     del model, tokenizer, trainer
     torch.cuda.empty_cache()
-    return row
+    return rows

@@ -50,8 +50,15 @@ _merge_peta_tasks()
 PETA_TASK_NAMES: list[str] = [n for n in TASKS if n.startswith("peta_")]
 
 
+def peta_run_tasks() -> list[str]:
+    """Curated PETA tasks for groups (dropped ones stay runnable by name)."""
+    from plm_benchmark.peta_data import PETA_DROPPED_TASKS
+
+    return [n for n in PETA_TASK_NAMES if n not in PETA_DROPPED_TASKS]
+
+
 def all_task_names() -> list[str]:
-    return PER_PROTEIN_TASKS + PETA_TASK_NAMES
+    return PER_PROTEIN_TASKS + peta_run_tasks()
 
 
 def resolve_tasks(task_arg: str) -> list[str]:
@@ -59,7 +66,7 @@ def resolve_tasks(task_arg: str) -> list[str]:
     if arg == "all":
         return PER_PROTEIN_TASKS.copy()
     if arg == "peta_all":
-        return PETA_TASK_NAMES.copy()
+        return peta_run_tasks()
     if arg == "everything":
         return all_task_names()
 
@@ -84,6 +91,15 @@ def run_splits_for(name: str) -> list[str | None]:
     if spec.peta_key and spec.peta_key in PETA_RUN_SPLITS:
         return list(PETA_RUN_SPLITS[spec.peta_key])
     return [spec.default_split]  # may be None (Rost / single-split PETA)
+
+
+def shares_train_across_splits(name: str) -> bool:
+    """True if this task's splits share train+valid and differ only in the test set,
+    so one training run can score every split (remote_homology, deeploc_2)."""
+    from plm_benchmark.peta_data import PETA_SHARED_TRAIN_KEYS
+
+    spec = TASKS[name]
+    return bool(spec.peta_key and spec.peta_key in PETA_SHARED_TRAIN_KEYS)
 
 
 def _validate_split(name: str, split: str) -> None:

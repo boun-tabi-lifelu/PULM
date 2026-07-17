@@ -29,6 +29,7 @@ EXPERIMENT_FIELDS = [
     "metric",
     "test_score",
     "val_score",
+    "collapsed",
     "epochs",
     "lr",
     "batch",
@@ -67,14 +68,15 @@ def append_experiment(row: dict, path: Path = LOG_CSV) -> None:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
-def load_experiments(path: Path = LOG_CSV, *, keep_all: bool = False) -> pd.DataFrame:
+def load_experiments(path: Path = LOG_CSV, *, keep_all: bool = False, keep_failed: bool = False) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     df = pd.read_csv(path)
     if df.empty:
         return df
-    ok = df["test_score"].notna() & (df["test_score"].astype(str) != "")
-    df = df[ok]
+    if not keep_failed:
+        ok = df["test_score"].notna() & (df["test_score"].astype(str) != "")
+        df = df[ok]
     sort_col = next((c for c in ("end_datetime", "start_datetime", "timestamp") if c in df.columns), None)
     if sort_col:
         df = df.sort_values(sort_col)
@@ -85,7 +87,7 @@ def load_experiments(path: Path = LOG_CSV, *, keep_all: bool = False) -> pd.Data
 
 
 def build_comparison(log_path: Path = LOG_CSV, out_path: Path = COMPARE_CSV) -> pd.DataFrame:
-    df = load_experiments(log_path, keep_all=True)
+    df = load_experiments(log_path, keep_all=True, keep_failed=True)
     if df.empty:
         raise FileNotFoundError(f"No experiments in {log_path}")
 
@@ -97,14 +99,23 @@ def build_comparison(log_path: Path = LOG_CSV, out_path: Path = COMPARE_CSV) -> 
     df = df.copy()
     df["test_score"] = pd.to_numeric(df["test_score"], errors="coerce")
     df["val_score"] = pd.to_numeric(df["val_score"], errors="coerce")
+    # A collapsed run (NaN metric = constant predictions) is a failure, not a score:
+    # count it, never average it.
+    flagged = (
+        df["collapsed"].astype(str).replace({"nan": "", "None": ""}) != ""
+        if "collapsed" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    df["_collapsed"] = flagged | df["test_score"].isna()
 
     group_cols = [c for c in ["task", "model", "tokenizer", "method", "split"] if c in df.columns]
     rows = []
     for keys, sub in df.groupby(group_cols, sort=True):
         record = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
         metric = sub["metric"].iloc[0]
-        scores = sub["test_score"].dropna()
-        vals = sub["val_score"].dropna()
+        good = sub[~sub["_collapsed"]]
+        scores = good["test_score"].dropna()
+        vals = good["val_score"].dropna()
         # constant within a (model, tokenizer) group; carried through for readability
         if "vocab_size" in sub.columns:
             record["vocab_size"] = sub["vocab_size"].iloc[0]
@@ -113,6 +124,7 @@ def build_comparison(log_path: Path = LOG_CSV, out_path: Path = COMPARE_CSV) -> 
                 **record,
                 "metric": metric,
                 "n_seeds": len(scores),
+                "n_collapsed": int(sub["_collapsed"].sum()),
                 "test_mean": round(scores.mean(), 6) if len(scores) else "",
                 "test_std": round(scores.std(ddof=0), 6) if len(scores) > 1 else 0.0,
                 "val_mean": round(vals.mean(), 6) if len(vals) else "",

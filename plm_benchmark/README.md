@@ -47,6 +47,71 @@ remote_homology). Each `(task, split)` is a separate run, logged with its own `s
 - `--task peta_gb1` (no `--split-method`) → the **default** split only (backward-compatible;
   task names are unchanged, so earlier default-split results stay valid).
 
+## PETA task selection (the curated 19)
+
+`peta_all` / `everything` run a **curated 19** task/splits — 18 protein-wise + `ppi_shs27k` —
+chosen from measured cost and discriminative power (~26% of the full grid's cost). Everything
+dropped below is **still runnable explicitly** (`--task peta_ppi_yeast`, `--split-method hpa_test`);
+it is only excluded from the groups.
+
+### Kept (19)
+| task | splits | why |
+|---|---|---|
+| `peta_fluorescence`, `peta_stability` | default | TAPE fitness; clean vocab trend |
+| `peta_gb1` | `two_vs_rest`, `three_vs_rest`, `low_vs_high` | FLIP fitness at 3 difficulties (cheap: 1–5 min) |
+| `peta_aav` | `two_vs_many` | one AAV split; the canonical FLIP 28,626/3,181/50,776 |
+| `peta_meltome` | `human`, `mixed_split` | thermostability, two regimes |
+| `peta_remote_homology` | `family`/`superfamily`/`fold` holdout | structure; all 3 ≈ **free** (shared train, see below) |
+| `peta_deepsol`, `peta_esol`, `peta_solmut_{blat,cs,lgk}` | default | solubility: classification + MSE + 3 mutation sets |
+| `peta_deeploc_binary`, `peta_deeploc_2` | default / `test` | localization |
+| `peta_ppi_shs27k` | default | the **only** protein-pair task that isn't leaky (below) |
+
+### Dropped — and why
+
+**PPI binary tasks (`ppi_yeast`, `ppi_sun`) — measured by memorisation, not biology.**
+PETA splits protein *pairs* at random, so the same proteins appear in train and test. A model can
+score highly by memorising which proteins are promiscuous. Our from-scratch baseline proves it —
+same architecture, same method, **only the tokenizer differs**:
+
+| task | scratch **AA** | scratch best sub-word | gap |
+|---|---|---|---|
+| `ppi_sun` | 0.502 *(chance)* | 0.989 | **+48.7** |
+| `ppi_yeast` | 0.567 | 0.954 | **+38.7** |
+| `ppi_shs27k` | 0.548 | 0.574 | **+2.6** ✅ |
+
+A *randomly-initialised single-layer* encoder reaches 0.99 on `sun` with any sub-word tokenizer and
+exactly chance with the amino-acid tokenizer — and beats pretrained ESM2-35M (0.948). An untrained
+1-layer model contains no biology; the only thing a larger vocabulary buys it is more distinct tokens,
+i.e. **protein fingerprinting**. These tasks would therefore reward vocabulary size for an artifactual
+reason and invert our conclusion, so they are excluded. `shs27k` predicts interaction *type* (7 classes)
+among pairs that already interact, so identity doesn't help — the shortcut is structurally closed, it
+follows the global vocab trend in the pretrained arm (AA 0.512 → BPE_25600 0.413), and it reproduces
+PETA's reported ~0.52. It is kept as the protein-pair representative.
+
+**Saturated (`deeploc_1`, `deeploc_signal`)** — 0.90–0.96 for every tokenizer; a ceiling effect
+leaves almost no signal to separate tokenizers.
+
+**Cost (`aav/des_mut`, `aav/mut_des`, `aav/seven_vs_many`, `ppi_sun`)** — 1.5–9 h *per model per seed*
+(`des_mut` alone: ~6 h). `aav/two_vs_many` covers AAV at ~1/7 the cost.
+
+**Redundant** — `deeploc_2/hpa_test` (tracks `test`), `meltome/human_cell` (tracks `human`),
+`aav/{one_vs_many, low_vs_high, sampled}`, `gb1/sampled`.
+
+**Degenerate (`gb1/one_vs_rest`)** — after the canonical FLIP rebuild it has **25 train / 3 validation**
+sequences. Spearman on 3 points is undefined-to-meaningless, so best-val selection is pure noise.
+
+> Caveat on a kept split: `gb1/two_vs_rest` has only **43** validation sequences (the pipeline warns).
+> Its test scores swing 0.005–0.585 at healthy val scores — treat it as low-confidence.
+
+### Shared-train tasks: one training run, many test sets
+`remote_homology` (3 holdouts) and `deeploc_2` (`test`/`hpa_test`) **share the same train and
+validation set** — only the test file differs. (Proof: `val_score` is identical across the holdouts.)
+The pipeline detects this and trains **once**, then scores every requested test set, emitting one row
+per split. That's a 3× / 2× saving and it is *exact* — literally the same model.
+
+Because those rows come from one run, their `duration_sec` is the whole run's time and is **not
+additive** across the splits of that task.
+
 ## Training modes (`--method`)
 
 | Method | Encoder | Notes |
@@ -225,8 +290,12 @@ root are still detected as a fallback.)
   `checkpoint_policy`, `checkpoint`, `run_dir`. `model`/`tokenizer` are split from the raw
   name: e.g. `ESM2_35M` + `PUMA_blosum62_07_005_12800_all`; hub ESM2 → tokenizer `AA`;
   scratch → `scratch_d<dim>_l<layers>_h<heads>` + the `--tokenizer` label.
+- **`collapsed`** — a NaN metric means the model emitted *constant* predictions: the run **failed**,
+  it is not a score. Flagged loudly at run time (`test_nan` / `val_nan`), counted as `n_collapsed`
+  in `comparison.csv`, and **never averaged into `test_mean`**. Watch for it on large-vocab
+  tokenizers (BPE_25600/51200), where frozen-encoder runs tend to degenerate.
 - `outputs/comparison.csv` — aggregated mean/std per `(task, model, tokenizer, method, split)`
-  via `python -m plm_benchmark.cli compare`.
+  via `python -m plm_benchmark.cli compare`; includes `n_seeds` (valid runs) and `n_collapsed`.
 - `outputs/<model>/<tokenizer>/<task>/<split>/<method>/seed_<n>/` — Trainer cache +
   `finetuned_weights.pth`. Keyed on `(model, tokenizer)` so scratch capacity variants don't
   collide.

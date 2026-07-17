@@ -221,16 +221,27 @@ PETA_DEFAULT_SPLIT: dict[str, str] = {
 # Curated splits to enumerate for a task under groups (all/peta_all/everything) or
 # `--split-method all`. Keyed by peta_key; default split first. Any split in
 # PETA_SPLIT_OPTIONS is still runnable explicitly via --split-method even if omitted here.
-# NOTE: gb1/one_vs_rest is omitted — after the canonical FLIP rebuild it has only
-# 25 train / 3 validation sequences, so best-val selection is pure noise (Spearman on
-# 3 points). It remains runnable explicitly via --split-method one_vs_rest.
+# Curated benchmark: 18 protein-wise task/splits + ppi_shs27k = 19 runs.
+# Anything omitted here stays runnable explicitly (--task X --split-method Y); it is only
+# excluded from the groups (peta_all / everything). See plm_benchmark/README.md
+# ("PETA task selection") for the rationale behind every keep/drop.
 PETA_RUN_SPLITS: dict[str, list[str]] = {
-    "gb1": ["two_vs_rest", "three_vs_rest", "low_vs_high"],
-    "aav": ["seven_vs_many", "des_mut", "mut_des", "two_vs_many", "one_vs_many", "low_vs_high"],
-    "meltome": ["human", "mixed_split", "human_cell"],
-    "remote_homology": ["family_holdout", "fold_holdout", "superfamily_holdout"],
-    "deeploc_2": ["test", "hpa_test"],
+    "gb1": ["two_vs_rest", "three_vs_rest", "low_vs_high"],  # one_vs_rest: 3 val seqs; sampled: redundant
+    "aav": ["two_vs_many"],  # des_mut/mut_des/seven_vs_many: 5-9 h each; one_vs_many/low_vs_high/sampled: redundant
+    "meltome": ["human", "mixed_split"],  # human_cell: ~duplicates human
+    "remote_homology": ["family_holdout", "fold_holdout", "superfamily_holdout"],  # shared train -> ~free
+    "deeploc_2": ["test"],  # hpa_test: correlates with test
 }
+
+# Tasks excluded from the groups entirely (still runnable by name):
+#   ppi_yeast, ppi_sun  -> solved by protein-identity memorisation, not biology
+#   deeploc_1, deeploc_signal -> saturated (0.90-0.96 for every tokenizer)
+PETA_DROPPED_TASKS: set[str] = {"peta_ppi_yeast", "peta_ppi_sun", "peta_deeploc_1", "peta_deeploc_signal"}
+
+# Splits of these datasets share the SAME train and valid set; only the test file differs
+# (remote_homology -> test_<holdout>.json, deeploc_2 -> <split>.json). Train once, score
+# every test set: 3x / 2x saving, and exact (it is literally the same trained model).
+PETA_SHARED_TRAIN_KEYS: set[str] = {"remote_homology", "deeploc_2"}
 
 
 def load_peta_splits(

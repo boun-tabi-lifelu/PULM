@@ -18,7 +18,7 @@ from plm_benchmark.config import (
 )
 from plm_benchmark.methods import WandbConfig, run_downstream
 from plm_benchmark.results import append_experiment, build_comparison, load_experiments
-from plm_benchmark.tasks import TASKS, load_splits, resolve_task_splits
+from plm_benchmark.tasks import TASKS, load_splits, resolve_task_splits, shares_train_across_splits
 
 
 def _parse_seeds(args: argparse.Namespace) -> list[int]:
@@ -41,6 +41,22 @@ def _wandb_cfg(args: argparse.Namespace) -> WandbConfig:
     )
 
 
+def _group_runs(pairs: list[tuple[str, str | None]]) -> list[tuple[str, list[str | None]]]:
+    """Collapse splits that share train+valid into ONE training run with several test
+    sets (remote_homology, deeploc_2): 3x / 2x cheaper and it is the same model anyway."""
+    out: list[tuple[str, list[str | None]]] = []
+    shared: dict[str, list[str | None]] = {}
+    for task, split in pairs:
+        if shares_train_across_splits(task):
+            if task not in shared:
+                shared[task] = []
+                out.append((task, shared[task]))  # filled by the appends below
+            shared[task].append(split)
+        else:
+            out.append((task, [split]))
+    return out
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     model_cfg = resolve_model(
         args.model, args.checkpoint, tokenizer=args.tokenizer, parent_collapse=args.parent_collapse
@@ -54,11 +70,22 @@ def cmd_train(args: argparse.Namespace) -> None:
     seeds = _parse_seeds(args)
     wandb_cfg = _wandb_cfg(args)
 
-    for name, split in task_splits:
+    for name, splits in _group_runs(task_splits):
         spec = TASKS[name]
+        split = splits[0]
         for seed in seeds:
             try:
-                train, valid, test = load_splits(spec, split_method=split)
+                # Shared-train tasks: train/valid come from any split; only test differs.
+                train, valid, first_test = load_splits(spec, split_method=split)
+                test_sets = {split: first_test}
+                for extra in splits[1:]:
+                    test_sets[extra] = load_splits(spec, split_method=extra)[2]
+                if len(test_sets) > 1:
+                    print(
+                        f"[shared-train] {name}: one training run scoring {len(test_sets)} test "
+                        f"sets {list(test_sets)}",
+                        flush=True,
+                    )
                 run_downstream(
                     spec,
                     model_cfg,
@@ -88,10 +115,10 @@ def cmd_train(args: argparse.Namespace) -> None:
                     resume_from_checkpoint=args.resume_from_checkpoint,
                     train_df=train,
                     valid_df=valid,
-                    test_df=test,
+                    test_sets=test_sets,
                 )
             except Exception as e:
-                print(f"FAILED {name} split={split or 'default'} seed={seed}: {e}")
+                print(f"FAILED {name} split={'+'.join(str(x or 'default') for x in splits)} seed={seed}: {e}")
                 now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 append_experiment(
                     {
