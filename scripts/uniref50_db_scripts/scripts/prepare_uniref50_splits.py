@@ -59,7 +59,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S", level=logging.INFO)
 logger = logging.getLogger("prep_uniref50")
 
-DEFAULT_DB = "/cta/share/users/uniprot/uniref/uniref_2024_06/uniref50_representatives.db"
+DEFAULT_DB = "/cta/share/users/uniprot/uniref/uniref50_2026_02/uniref50_representatives.db"
 
 
 # --------------------------------------------------------------------------- #

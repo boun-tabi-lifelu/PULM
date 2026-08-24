@@ -857,9 +857,9 @@ def parse_args():
     p.add_argument("--mlm_probability", type=float, default=0.15)
 
     # optimisation (ESM2-flavoured defaults)
-    p.add_argument("--per_device_train_batch_size", type=int, default=16)
-    p.add_argument("--per_device_eval_batch_size", type=int, default=16)
-    p.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    p.add_argument("--per_device_train_batch_size", type=int, default=64)
+    p.add_argument("--per_device_eval_batch_size", type=int, default=64)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=2)
     p.add_argument("--learning_rate", type=float, default=4e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--adam_beta1", type=float, default=0.9)

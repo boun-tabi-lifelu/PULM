@@ -1,0 +1,602 @@
+"""Unified PyTorch downstream pipeline for every Rost + PETA task.
+
+One HuggingFace-Trainer loop (attention1d pooling + linear head) serves all
+tasks and all modes (full_ft, embed_head=frozen encoder, lora, and the
+from-scratch tokenizer baseline). Recipe (lr / epochs / weight-decay / patience)
+comes from the task spec, so Rost and PETA differ only by configuration.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import inspect
+import math
+import os
+import random
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from functools import lru_cache, partial
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import EarlyStoppingCallback, Trainer, TrainingArguments, set_seed
+
+from plm_benchmark.config import (
+    CHECKPOINT_POLICY,
+    EARLY_STOPPING_PATIENCE,
+    LR_FULL_FT,
+    LR_HEAD,
+    LR_LORA,
+    LR_SCRATCH,
+    MAX_EPOCHS,
+    MAX_SEQ_LENGTH,
+    OUTPUTS_DIR,
+    ROOT,
+    WEIGHT_DECAY,
+)
+from plm_benchmark.methods.data import collate_ppi, collate_single, ppi_dataset, single_dataset
+from plm_benchmark.methods.metrics import metrics_fn, score_predictions
+from plm_benchmark.models import set_gpu
+from plm_benchmark.models.peta_classifier import build_model
+from plm_benchmark.results import append_experiment
+from plm_benchmark.tasks import TaskSpec, preprocess_ppi_splits, preprocess_sequences
+from plm_benchmark.tokenizers import resolve_tokenizer
+
+METHODS = {"full_ft", "full_ft_peta20", "lora", "embed_head"}
+DT_FMT = "%Y-%m-%d %H:%M:%S"  # experiments.csv datetimes: date + hh:mm:ss (UTC), no ms/offset
+
+
+@lru_cache(maxsize=1)
+def _git_commit() -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=str(ROOT), stderr=subprocess.DEVNULL
+        )
+        return out.decode().strip()
+    except Exception:
+        return ""
+
+
+def _model_identity(model_cfg, scratch_dim: int, scratch_layers: int, scratch_heads: int) -> tuple[str, str]:
+    """(model, tokenizer) for logging/grouping. full_name stays = model_cfg.name.
+
+    - hub ESM2  -> (ESM2_<SIZE>, AA)
+    - scratch   -> (scratch_d<dim>_l<layers>_h<heads>, <tokenizer-label>)
+    - PULM/local-> parse the run slug 'ESM2_<SIZE>_<TOK...>' -> (ESM2_<SIZE>, <TOK...>)
+    """
+    if model_cfg.backend == "scratch":
+        model = f"scratch_d{scratch_dim}_l{scratch_layers}_h{scratch_heads}"
+        label = model_cfg.name[len("scratch_"):] if model_cfg.name.startswith("scratch_") else model_cfg.name
+        return model, (label or "unknown")
+    if model_cfg.source == "hub":
+        return model_cfg.name.upper(), "AA"
+
+    # PULM/local: pick the run-slug component (starts with ESM2), dropping 'final'.
+    parts = [p for p in model_cfg.name.split("__") if p and p != "final"]
+    slug = next((p for p in reversed(parts) if p.upper().startswith("ESM2")), parts[-1] if parts else model_cfg.name)
+    seg = slug.split("_")
+    if len(seg) >= 2 and seg[0].upper() == "ESM2":
+        return f"{seg[0]}_{seg[1]}", ("_".join(seg[2:]) or "AA")
+    return slug, "AA"
+
+
+@dataclass
+class WandbConfig:
+    project: str | None = None
+    run_name: str | None = None
+    entity: str | None = None
+    group: str | None = None
+    mode: str = "online"
+    run_id: str | None = None
+    resume: str = "allow"
+
+
+def make_training_args(kwargs: dict) -> TrainingArguments:
+    """Build TrainingArguments across transformers versions.
+
+    Field names drift between releases (e.g. the boolean ``group_by_length``
+    became ``train_sampling_strategy="group_by_length"`` in v5, and
+    ``evaluation_strategy`` became ``eval_strategy``). Map known renames, then
+    drop anything the installed version doesn't accept.
+    """
+    valid = {f.name for f in dataclasses.fields(TrainingArguments) if f.init}
+    kwargs = dict(kwargs)
+
+    # group_by_length (bool, <=v4)  <->  train_sampling_strategy (str, >=v5)
+    if "group_by_length" in kwargs and "group_by_length" not in valid:
+        grouped = kwargs.pop("group_by_length")
+        if "train_sampling_strategy" in valid:
+            kwargs["train_sampling_strategy"] = "group_by_length" if grouped else "random"
+
+    # eval_strategy (>=4.41)  <->  evaluation_strategy (older)
+    if "eval_strategy" in kwargs and "eval_strategy" not in valid and "evaluation_strategy" in valid:
+        kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
+
+    dropped = [k for k in list(kwargs) if k not in valid]
+    for k in dropped:
+        print(f"  (dropping TrainingArguments kwarg unsupported by this transformers version: {k})", flush=True)
+        kwargs.pop(k)
+    return TrainingArguments(**kwargs)
+
+
+def _set_seeds(seed: int) -> None:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    set_seed(seed)
+
+
+def _resolve_epochs(method: str, epochs: int | None) -> int:
+    if epochs:
+        return epochs
+    if method == "full_ft_peta20":
+        return 20
+    return MAX_EPOCHS
+
+
+def _resolve_lr(model_cfg, method: str, lr: float | None) -> float:
+    """LR by training regime, not by task source."""
+    if lr is not None:
+        return lr
+    if model_cfg.backend == "scratch":
+        return LR_SCRATCH  # random init: no pretrained weights to preserve
+    if method == "embed_head":
+        return LR_HEAD  # frozen encoder, train head only
+    if method == "lora":
+        return LR_LORA
+    return LR_FULL_FT  # full_ft / full_ft_peta20 on a pretrained encoder
+
+
+def _setup_wandb(
+    cfg: WandbConfig | None,
+    default_run_name: str,
+    default_group: str,
+    resume_from_checkpoint,
+) -> tuple[list[str], str | None]:
+    """Wire env vars for a single run. Returns (report_to, run_name)."""
+    if cfg is None or not cfg.project:
+        return ["none"], None
+
+    os.environ["WANDB_PROJECT"] = cfg.project
+    os.environ["WANDB_MODE"] = cfg.mode
+    if cfg.entity:
+        os.environ["WANDB_ENTITY"] = cfg.entity
+    os.environ["WANDB_RUN_GROUP"] = cfg.group or default_group
+
+    # Continue THE SAME run only when an id is given (resume/merge). Otherwise a
+    # fresh run per (task, seed) — clear any stale id so the loop never collides.
+    if cfg.run_id:
+        os.environ["WANDB_RUN_ID"] = cfg.run_id
+        os.environ["WANDB_RESUME"] = cfg.resume
+    else:
+        os.environ.pop("WANDB_RUN_ID", None)
+        os.environ.pop("WANDB_RESUME", None)
+        if resume_from_checkpoint:
+            print(
+                "WARNING: resuming from checkpoint without --wandb_run_id; wandb will start a NEW "
+                "run. Pass --wandb_run_id <id> to append to the original run.",
+                flush=True,
+            )
+    return ["wandb"], (cfg.run_name or default_run_name)
+
+
+def _finish_wandb(report_to: list[str]) -> None:
+    if "wandb" in report_to:
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                wandb.finish()
+        except Exception:  # pragma: no cover - wandb optional
+            pass
+
+
+@torch.no_grad()
+def _test_score(model, tokenizer, test_df, spec, collator, *, batch_size: int) -> float:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device).eval()
+
+    if spec.task_type == "ppi":
+        ds = ppi_dataset(test_df)
+    else:
+        ds = single_dataset(test_df, spec)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collator)
+
+    preds, labels = [], []
+    for batch in tqdm(loader, desc="test"):
+        moved = {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
+        logits = model(**moved).logits
+        preds.append(logits.cpu().numpy())
+        labels.append(moved["labels"].cpu().numpy())
+    return score_predictions(np.concatenate(preds, axis=0), np.concatenate(labels, axis=0), spec)
+
+
+def _setup_embed_cache(
+    model, tokenizer, spec, model_name, tokenizer_name, split_tag, train_df, valid_df,
+    *, checkpoint, max_length, batch_size, cache_dir, max_gb, amp_dtype=None,
+):
+    """Build/load the frozen-encoder cache. Returns (train_ds, valid_ds, collator) or None
+    to fall back to on-the-fly encoding (over budget / unusable)."""
+    from plm_benchmark.methods.data import label_dtype
+    from plm_benchmark.methods.embed_cache import (
+        CachedHidden,
+        CachedHiddenDataset,
+        build_cache,
+        collate_cached,
+        estimate_bytes,
+        _subset_dir,
+    )
+
+    base = Path(cache_dir) if cache_dir else (OUTPUTS_DIR / "embeddings")
+    hidden_size = model.encoder.config.hidden_size
+    lens = [len(s) for s in list(train_df["sequence"]) + list(valid_df["sequence"])]
+    est_gb = estimate_bytes(lens, hidden_size, max_length) / 1e9
+    if est_gb > max_gb:
+        print(
+            f"NOTE: embed cache ~{est_gb:.1f} GB exceeds --embed-cache-max-gb {max_gb:g}; "
+            "encoding on the fly instead.",
+            flush=True,
+        )
+        return None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    stores = {}
+    for subset, df in (("train", train_df), ("valid", valid_df)):
+        path = _subset_dir(base, model_name, tokenizer_name, spec.name, split_tag, subset)
+        if not CachedHidden.matches(path, checkpoint, max_length):
+            print(f"[embed-cache] building {subset} ({len(df)} seqs, ~{est_gb:.1f} GB total) -> {path}", flush=True)
+            build_cache(
+                path, model.encoder, tokenizer, list(df["sequence"]),
+                checkpoint=checkpoint, max_length=max_length, batch_size=batch_size,
+                device=device, amp_dtype=amp_dtype,
+            )
+        else:
+            print(f"[embed-cache] reusing {subset} cache -> {path}", flush=True)
+        stores[subset] = CachedHidden(path)
+
+    dtype = label_dtype(spec)
+    train_ds = CachedHiddenDataset(stores["train"], list(train_df["label"]), [len(s) for s in train_df["sequence"]])
+    valid_ds = CachedHiddenDataset(stores["valid"], list(valid_df["label"]), [len(s) for s in valid_df["sequence"]])
+    return train_ds, valid_ds, partial(collate_cached, label_dtype=dtype)
+
+
+def _cached_trainer_class(lengths):
+    """Trainer for the embed-cache path.
+
+    The cached dataset is a plain torch Dataset, not a `datasets.Dataset`, so Trainer
+    cannot read a `length` column and falls back to inferring lengths from `input_ids`
+    (which cached items don't have) -> "Can only automatically infer lengths ...".
+    Both samplers must therefore be supplied explicitly:
+      * train: LengthGroupedSampler over the same per-sequence char lengths the uncached
+        path groups on, so batch composition matches.
+      * eval:  sequential. Eval batch composition cannot affect the metric (pooling is
+        per-sequence and masked; all predictions are aggregated), so this is safe.
+    """
+
+    class _CachedTrainer(Trainer):
+        def _get_train_sampler(self, *args, **kwargs):
+            from torch.utils.data import RandomSampler
+
+            try:
+                from transformers.trainer_pt_utils import LengthGroupedSampler
+
+                bs = self.args.train_batch_size * self.args.gradient_accumulation_steps
+                return LengthGroupedSampler(bs, lengths=list(lengths))
+            except Exception as e:  # version drift -> degrade, don't crash
+                print(
+                    f"NOTE: length grouping unavailable for the cached path ({e}); using a random sampler.",
+                    flush=True,
+                )
+                return RandomSampler(self.train_dataset)
+
+        def _get_eval_sampler(self, *args, **kwargs):
+            from torch.utils.data import SequentialSampler
+
+            ds = args[0] if args else kwargs.get("eval_dataset", None)
+            if ds is None:
+                ds = self.eval_dataset
+            return SequentialSampler(ds)
+
+    return _CachedTrainer
+
+
+def _collapse_flags(test, val) -> str:
+    """A NaN metric means constant predictions -> the run collapsed, it is not a score."""
+    def _bad(x):
+        return x is None or (isinstance(x, (int, float)) and math.isnan(float(x)))
+
+    flags = []
+    if _bad(test):
+        flags.append("test_nan")
+    if _bad(val):
+        flags.append("val_nan")
+    return ";".join(flags)
+
+
+def _best_val(history, metric_key: str, greater_is_better: bool):
+    vals = [x[metric_key] for x in history if metric_key in x]
+    if not vals:
+        return None
+    return max(vals) if greater_is_better else min(vals)
+
+
+def run_downstream(
+    spec: TaskSpec,
+    model_cfg,
+    *,
+    method: str,
+    split: str | None,
+    gpu: int,
+    epochs: int | None,
+    batch: int,
+    accum: int,
+    lr: float | None,
+    seed: int,
+    fp16: bool,
+    max_length: int = MAX_SEQ_LENGTH,
+    val_batch: int = 64,
+    eval_every: int = 1,
+    patience: int | None = None,
+    tokenizer_spec: str | None = None,
+    parent_collapse: bool = False,
+    scratch_dim: int = 320,
+    scratch_layers: int = 0,
+    scratch_heads: int = 8,
+    embed_cache: bool = False,
+    embed_cache_dir: str | None = None,
+    embed_cache_max_gb: float = 50.0,
+    num_workers: int = 4,
+    wandb_cfg: WandbConfig | None = None,
+    resume_from_checkpoint: str | None = None,
+    train_df=None,
+    valid_df=None,
+    test_df=None,
+    test_sets=None,
+) -> list[dict]:
+    if method not in METHODS:
+        raise ValueError(f"Unknown method {method!r}. Choose from {sorted(METHODS)}.")
+    if method == "lora" and model_cfg.backend == "scratch":
+        raise ValueError("lora is not applicable to the scratch baseline (no attention modules).")
+
+    start_dt = datetime.now(timezone.utc)
+
+    freeze = method == "embed_head"
+    use_lora = method == "lora"
+    is_ppi = spec.task_type == "ppi"
+    is_scratch = model_cfg.backend == "scratch"
+
+    epochs = _resolve_epochs(method, epochs)
+    lr = _resolve_lr(model_cfg, method, lr)
+    weight_decay = WEIGHT_DECAY
+    stop_patience = EARLY_STOPPING_PATIENCE if patience is None else patience
+    metric_for_best = f"eval_{spec.metric}"
+    model_name, tokenizer_name = _model_identity(model_cfg, scratch_dim, scratch_layers, scratch_heads)
+
+    set_gpu(gpu)
+    _set_seeds(seed)
+
+    split_tag = split or "default"
+    if test_sets is None:
+        test_sets = {split_tag: test_df}
+    multi_test = len(test_sets) > 1
+
+    if is_ppi:
+        key = next(iter(test_sets))
+        train_df, valid_df, cleaned = preprocess_ppi_splits(train_df, valid_df, test_sets[key])
+        test_sets = {key: cleaned}
+        train_ds, valid_ds = ppi_dataset(train_df), ppi_dataset(valid_df)
+    else:
+        train_df = preprocess_sequences(train_df, task_type=spec.task_type)
+        valid_df = preprocess_sequences(valid_df, task_type=spec.task_type)
+        test_sets = {k: preprocess_sequences(v, task_type=spec.task_type) for k, v in test_sets.items()}
+        train_ds, valid_ds = single_dataset(train_df, spec), single_dataset(valid_df, spec)
+
+    # Splits that share train+valid produce ONE trained model -> one run dir, many rows.
+    train_tag = "shared" if multi_test else split_tag
+    # Keyed on (model, tokenizer) so scratch variants (dim/layers/heads) never collide.
+    run_dir = OUTPUTS_DIR / model_name / tokenizer_name / spec.name.lower() / train_tag / method / f"seed_{seed}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    default_run_name = f"{model_name}/{tokenizer_name}/{spec.name}/{train_tag}/{method}/seed{seed}"
+    default_group = f"{model_name}/{tokenizer_name}"
+    report_to, run_name = _setup_wandb(wandb_cfg, default_run_name, default_group, resume_from_checkpoint)
+
+    mode = "frozen-encoder" if freeze else ("lora" if use_lora else "full")
+    print(
+        f"\n=== {spec.name} | {method} ({mode}) | split={train_tag} | seed={seed} "
+        f"| model={model_name} tokenizer={tokenizer_name} [{model_cfg.backend}] ===",
+        flush=True,
+    )
+    print(
+        f"Train/valid: {len(train_df)}/{len(valid_df)} | epochs={epochs} lr={lr} wd={weight_decay} "
+        f"patience={stop_patience} eval_every={eval_every}ep | head=attention1d | metric={spec.metric}",
+        flush=True,
+    )
+
+    if parent_collapse:
+        from plm_benchmark.models.collapse import build_collapse_tokenizer_from_spec
+
+        tokenizer_obj = build_collapse_tokenizer_from_spec(tokenizer_spec, max_length)
+    elif tokenizer_spec:
+        tokenizer_obj = resolve_tokenizer(tokenizer_spec, max_length=max_length)
+    else:
+        tokenizer_obj = None
+    model, tokenizer = build_model(
+        model_cfg,
+        spec,
+        tokenizer=tokenizer_obj,
+        freeze=freeze,
+        use_lora=use_lora,
+        scratch_dim=scratch_dim,
+        scratch_layers=scratch_layers,
+        scratch_heads=scratch_heads,
+    )
+    if is_ppi:
+        collator = partial(collate_ppi, tokenizer=tokenizer, max_length=max_length)
+    else:
+        collator = partial(collate_single, tokenizer=tokenizer, max_length=max_length, spec=spec)
+    test_collator = collator  # test always runs through the real encoder
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported() and not fp16
+
+    # embed_head fast path: the frozen encoder's per-residue outputs are identical every
+    # epoch, so compute them once and train the attention1d head off the cache.
+    cached_mode = False
+    if embed_cache and freeze and not is_ppi:
+        cached = _setup_embed_cache(
+            model,
+            tokenizer,
+            spec,
+            model_name,
+            tokenizer_name,
+            split_tag,
+            train_df,
+            valid_df,
+            checkpoint=model_cfg.checkpoint,
+            max_length=max_length,
+            batch_size=val_batch,
+            cache_dir=embed_cache_dir,
+            max_gb=embed_cache_max_gb,
+            amp_dtype=(torch.bfloat16 if use_bf16 else (torch.float16 if fp16 else None)),
+        )
+        if cached is not None:
+            train_ds, valid_ds, collator = cached
+            cached_mode = True
+    elif embed_cache and not freeze:
+        print("NOTE: --embed-cache only applies to --method embed_head (frozen encoder); ignoring.", flush=True)
+    elif embed_cache and is_ppi:
+        print("NOTE: --embed-cache is not supported for PPI tasks (paired inputs); ignoring.", flush=True)
+
+    # Eval/checkpoint cadence: every epoch by default (unchanged behaviour). When
+    # eval_every > 1, switch to a steps schedule so we eval + checkpoint every
+    # eval_every epochs (fewer large-val forward passes + fewer checkpoint writes).
+    if eval_every > 1:
+        steps_per_epoch = max(1, math.ceil(len(train_ds) / (batch * accum)))
+        total_steps = steps_per_epoch * epochs
+        # Ensure at least one eval happens, else load_best_model_at_end has nothing.
+        cadence_steps = min(eval_every * steps_per_epoch, total_steps)
+        cadence = dict(
+            eval_strategy="steps",
+            save_strategy="steps",
+            logging_strategy="steps",
+            eval_steps=cadence_steps,
+            save_steps=cadence_steps,
+            logging_steps=cadence_steps,
+        )
+    else:
+        cadence = dict(eval_strategy="epoch", save_strategy="epoch", logging_strategy="epoch")
+
+    ta_kwargs = dict(
+        output_dir=str(run_dir / "hf_cache"),
+        **cadence,
+        load_best_model_at_end=True,
+        metric_for_best_model=metric_for_best,
+        greater_is_better=spec.greater_is_better,
+        save_total_limit=1,
+        learning_rate=lr,
+        weight_decay=weight_decay,
+        per_device_train_batch_size=batch,
+        per_device_eval_batch_size=val_batch,
+        gradient_accumulation_steps=accum,
+        num_train_epochs=epochs,
+        seed=seed,
+        fp16=fp16 and not use_bf16,
+        bf16=use_bf16,
+        group_by_length=True,
+        length_column_name="length",
+        dataloader_num_workers=num_workers,
+        dataloader_pin_memory=True,
+        remove_unused_columns=False,
+        report_to=report_to,
+        run_name=run_name,
+    )
+
+    callbacks = []
+    if stop_patience and stop_patience > 0:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=stop_patience))
+
+    trainer_kwargs = dict(
+        model=model,
+        args=make_training_args(ta_kwargs),
+        train_dataset=train_ds,
+        eval_dataset=valid_ds,
+        data_collator=collator,
+        compute_metrics=metrics_fn(spec),
+        callbacks=callbacks,
+    )
+    if "processing_class" in inspect.signature(Trainer.__init__).parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        trainer_kwargs["tokenizer"] = tokenizer
+
+    trainer_cls = _cached_trainer_class(train_ds.lengths) if cached_mode else Trainer
+    trainer = trainer_cls(**trainer_kwargs)
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
+    weights = run_dir / "finetuned_weights.pth"
+    torch.save({n: p for n, p in model.named_parameters() if p.requires_grad}, weights)
+
+    val = _best_val(trainer.state.log_history, metric_for_best, spec.greater_is_better)
+
+    # One trained model -> score every test set that shares this train/valid.
+    scores = {}
+    for s, tdf in test_sets.items():
+        scores[s] = _test_score(model, tokenizer, tdf, spec, test_collator, batch_size=val_batch)
+        print(f"Test[{s}] {spec.metric}: {scores[s]:.4f} | best val: {val}", flush=True)
+
+    if "wandb" in report_to:
+        if multi_test:
+            trainer.log({f"test/{s}/{spec.metric}": v for s, v in scores.items()})
+        else:
+            trainer.log({f"test/{spec.metric}": next(iter(scores.values()))})
+    _finish_wandb(report_to)
+
+    end_dt = datetime.now(timezone.utc)
+    rows = []
+    for s, test in scores.items():
+        flags = _collapse_flags(test, val)
+        if flags:
+            print(
+                f"WARNING [{spec.name}/{s}]: run COLLAPSED ({flags}) — a NaN metric means constant "
+                f"predictions; this is a failed run, not a score.",
+                flush=True,
+            )
+        row = {
+            "start_datetime": start_dt.strftime(DT_FMT),
+            "end_datetime": end_dt.strftime(DT_FMT),
+            # NOTE: shared-train tasks emit several rows from ONE training run, so this
+            # duration is the whole run and is not additive across those rows.
+            "duration_sec": round((end_dt - start_dt).total_seconds(), 1),
+            "task": spec.name,
+            "model": model_name,
+            "tokenizer": tokenizer_name,
+            # actual embedding rows -> the POST-collapse size for parent-collapsed runs
+            "vocab_size": getattr(model.encoder.config, "vocab_size", ""),
+            "method": method,
+            "split": s,
+            "metric": spec.metric,
+            "test_score": round(test, 6),
+            "val_score": round(val, 6) if val is not None else "",
+            "collapsed": flags,
+            "epochs": epochs,
+            "lr": lr,
+            "batch": batch,
+            "seed": seed,
+            "full_name": model_cfg.name,
+            "scratch_dim": scratch_dim if is_scratch else "",
+            "scratch_layers": scratch_layers if is_scratch else "",
+            "scratch_heads": scratch_heads if is_scratch else "",
+            "git_commit": _git_commit(),
+            "checkpoint_policy": CHECKPOINT_POLICY,
+            "checkpoint": model_cfg.checkpoint,
+            "run_dir": str(run_dir.relative_to(OUTPUTS_DIR.parent)),
+        }
+        append_experiment(row)
+        rows.append(row)
+
+    del model, tokenizer, trainer
+    torch.cuda.empty_cache()
+    return rows

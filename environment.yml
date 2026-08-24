@@ -118,8 +118,6 @@ dependencies:
   - jupyterlab_pygments=0.1.2=py_0
   - jupyterlab_server=2.16.5=py39h06a4308_0
   - jupyterlab_widgets=3.0.5=pyhd8ed1ab_0
-  - keras=2.9.0=py39h06a4308_0
-  - keras-preprocessing=1.1.2=pyhd3eb1b0_0
   - krb5=1.19.4=h568e23c_0
   - lcms2=2.12=h3be6417_0
   - ld_impl_linux-64=2.38=h1181459_1
@@ -251,9 +249,6 @@ dependencies:
   - tensorboard=2.9.0=py39h06a4308_0
   - tensorboard-data-server=0.6.1=py39h52d8a92_0
   - tensorboard-plugin-wit=1.8.1=py39h06a4308_0
-  - tensorflow=2.9.1=cuda112py39h01bd6f0_0
-  - tensorflow-base=2.9.1=cuda112py39h81abfd3_0
-  - tensorflow-estimator=2.9.1=cuda112py39hd320b7a_0
   - termcolor=2.1.0=py39h06a4308_0
   - terminado=0.17.1=py39h06a4308_0
   - testpath=0.6.0=py39h06a4308_0
@@ -327,10 +322,10 @@ dependencies:
       - regex==2022.10.31
       - responses==0.18.0
       - safetensors==0.4.2
-      - tensorflow-addons==0.19.0
       - tokenizers==0.13.2
       - tqdm==4.64.1
       - transformers==4.26.1
+      - wandb==0.16.6
       - typeguard==2.13.3
       - uri-template==1.2.0
       - webcolors==1.12
