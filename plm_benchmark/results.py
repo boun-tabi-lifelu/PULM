@@ -97,12 +97,13 @@ def build_comparison(log_path: Path = LOG_CSV, out_path: Path = COMPARE_CSV) -> 
             df = best
 
     df = df.copy()
+    df['split'] = df['split'].fillna('default')
     df["test_score"] = pd.to_numeric(df["test_score"], errors="coerce")
     df["val_score"] = pd.to_numeric(df["val_score"], errors="coerce")
     # A collapsed run (NaN metric = constant predictions) is a failure, not a score:
     # count it, never average it.
     flagged = (
-        df["collapsed"].astype(str).replace({"nan": "", "None": ""}) != ""
+        pd.notna(df["collapsed"])
         if "collapsed" in df.columns
         else pd.Series(False, index=df.index)
     )
